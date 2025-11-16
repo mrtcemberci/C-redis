@@ -1,0 +1,6 @@
+test_hashmap
+test_parser
+*.o
+*.d
+.DS_Store*~*.swp*.swo
+*.dSYM/
