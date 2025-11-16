@@ -1,25 +1,26 @@
 CC = gcc
 CFLAGS = -g -Wall -Wextra -std=gnu11 -Iinclude
-
-TARGET = test_hashmap
-
-SRCS = src/hashmap.c tests/test_hashmap.c
-
-OBJS = $(SRCS:.c=.o)
+TARGETS = test_hashmap test_parser
 
 .PHONY: all clean check
 
-all: $(TARGET)
+all: $(TARGETS)
 
 check: all
-	@echo "--- Running Tests with Valgrind ---"
+	@echo "\n--- Running Hashmap Tests with Valgrind ---"
 	@valgrind --leak-check=full --show-leak-kinds=all ./test_hashmap
+	@echo "\n--- Running Parser Tests (No Valgrind) ---"
+	@./test_parser
+	@echo "\n--- All Checks Complete ---"
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS)
+test_hashmap: tests/test_hashmap.o src/hashmap.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+test_parser: tests/test_parser.o src/parser.o
+	$(CC) $(CFLAGS) -o $@ $^
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGETS) src/*.o tests/*.o
