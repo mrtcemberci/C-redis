@@ -1,5 +1,8 @@
 test_hashmap
 test_parser
+redis-clone
+*.log
+*.actual
 *.o
 *.d
 .DS_Store*~*.swp*.swo

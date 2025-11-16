@@ -1,0 +1,5 @@
+SET foo bar
+GET foo
+DEL foo
+GET foo
+GET "nonexistent"
