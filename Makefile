@@ -60,5 +60,4 @@ clean:
 	rm -f $(SERVER_EXE) $(TEST_HASHMAP_EXE) $(TEST_PARSER_EXE)
 	rm -f src/*.o tests/*.o
 	rm -f server.log
-	# Clean out the generated 'actual' files
 	rm -f tests/data/actual/*

@@ -9,6 +9,27 @@
 
 typedef struct HashMap HashMap;
 
+typedef struct {
+    const char* key;
+    const char* value;
+} HashMapEntry;
+
+typedef struct HashMapIterator HashMapIterator;
+
+/* Creates an iterator instance of the hashmap */
+HashMapIterator* hashmap_iterator_create(HashMap* map);
+
+/**
+ * Gets the next key-value pair from the iterator.
+ */
+HashMapEntry* hashmap_iterator_next(HashMapIterator* iter);
+
+/**
+ *  Frees the memory associated with the iterator.
+ */
+void hashmap_iterator_free(HashMapIterator* iter);
+
+
 // Create a new hash map
 HashMap* hashmap_create(void);
 

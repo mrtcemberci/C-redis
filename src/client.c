@@ -31,6 +31,10 @@ Client* client_create(int fd) {
     client->fd = fd;
     client->read_buffer_len = 0;
     client->read_buffer_capacity = INITIAL_READ_BUFFER_CAPACITY;
+
+    client->last_active_time = 0; // Will be set by server.c
+    client->next = NULL;
+    client->prev = NULL;
     
     g_clients[fd] = client; // Store it in our list of clients
     

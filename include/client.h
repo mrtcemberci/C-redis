@@ -2,11 +2,12 @@
 #define CLIENT_H
 
 #include <stddef.h> 
+#include <time.h> 
 
 struct Server;
 
 // This struct holds the state for one client
-typedef struct {
+typedef struct Client {
     int fd;
     
     // The dynamically-growing buffer for partial reads
@@ -15,6 +16,11 @@ typedef struct {
     size_t read_buffer_capacity;
     
     // Add a write_buffer later for partial writes
+
+    /* Used in the linked list for the timer wheel for inactivity in server.c */
+    time_t last_active_time;
+    struct Client* next;
+    struct Client* prev;
     
 } Client;
 

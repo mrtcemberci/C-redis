@@ -17,6 +17,66 @@ struct HashMap {
     size_t count;        // How many items
 };
 
+struct HashMapIterator {
+    HashMap* map;
+    size_t current_bucket;
+    HashNode* current_node;
+    
+    // We store the *last returned entry* here.
+    // This avoids a malloc/free for every "next" call.
+    HashMapEntry last_entry; 
+};
+
+HashMapIterator* hashmap_iterator_create(HashMap* map) {
+    if (map == NULL) return NULL;
+    
+    HashMapIterator* iter = malloc(sizeof(HashMapIterator));
+    if (iter == NULL) return NULL;
+    
+    iter->map = map;
+    iter->current_bucket = 0;
+    iter->current_node = NULL;
+    
+    return iter;
+}
+
+HashMapEntry* hashmap_iterator_next(HashMapIterator* iter) {
+    if (iter == NULL) return NULL;
+
+    //  Advance the current node in the linked list (if we're in one)
+    if (iter->current_node != NULL) {
+        iter->current_node = iter->current_node->next;
+    }
+
+    // If the list is done, find the next bucket
+    while (iter->current_node == NULL) {
+        //  Check if we've run out of buckets
+        if (iter->current_bucket >= iter->map->capacity) {
+            return NULL; // Iteration is finished
+        }
+        
+        //  Get the head of the next bucket
+        iter->current_node = iter->map->buckets[iter->current_bucket];
+        
+        //  Move to the next bucket index for the next time
+        iter->current_bucket++;
+        
+        // If this bucket was empty, the while loop will repeat
+        // and find the next non-empty bucket.
+    }
+
+    //  We have a valid node. Populate our static entry and return it.
+    iter->last_entry.key = iter->current_node->key;
+    iter->last_entry.value = iter->current_node->value;
+    
+    return &iter->last_entry;
+}
+
+void hashmap_iterator_free(HashMapIterator* iter) {
+    free(iter); // Just free the iterator struct itself
+}
+
+
 /*
     Bucket array is a malloced heap array
     Bucket 0 -> Node1 -> Node2 -> etc...
