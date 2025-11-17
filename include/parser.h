@@ -7,7 +7,7 @@
 #define MAX_COMMAND_ARGS 16
 
 /**
- * @brief Defines the possible return codes from the parser.
+ *  Defines the possible return codes from the parser.
  */
 typedef enum {
     PARSE_SUCCESS = 0,

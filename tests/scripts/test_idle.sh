@@ -11,7 +11,7 @@ echo "---  Starting Server in Background ---"
 SERVER_PID=$!
 # Updated trap to use echo
 trap "echo '--- Shutting Down Server ---'; kill $SERVER_PID" EXIT
-sleep 0.5 # Give server time to boot (Fixed typo: was 'echo 0.5')
+sleep 0.5 # Give server time to boot
 
 echo "---  Running Idle Timeout Test ---"
 
