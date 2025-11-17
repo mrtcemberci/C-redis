@@ -8,37 +8,42 @@
 // Define the global clients list (initialized to NULL)
 Client* g_clients[MAX_CLIENTS] = {0};
 
-#define INITIAL_READ_BUFFER_CAPACITY 1024
+#define INITIAL_READ_BUFFER_CAPACITY 1024 // 1024 characters
+#define INITIAL_WRITE_BUFFER_CAPACITY 1024 // 1024 characters
 
 Client* client_create(int fd) {
     if (fd < 0 || fd >= MAX_CLIENTS) {
-        return NULL; // Invalid FD
+        return NULL;
     }
 
-    // Allocate the struct
     Client* client = malloc(sizeof(Client));
-    if (client == NULL) {
-        return NULL;
-    }
+    if (client == NULL) goto fail;
 
-    // Allocate the initial read buffer
     client->read_buffer = malloc(INITIAL_READ_BUFFER_CAPACITY);
-    if (client->read_buffer == NULL) {
-        free(client);
-        return NULL;
-    }
-    
-    client->fd = fd;
+    if (client->read_buffer == NULL) goto fail_read_buf;
     client->read_buffer_len = 0;
     client->read_buffer_capacity = INITIAL_READ_BUFFER_CAPACITY;
+    
+    client->write_buffer = malloc(INITIAL_WRITE_BUFFER_CAPACITY);
+    if (client->write_buffer == NULL) goto fail_write_buf;
+    client->write_buffer_len = 0;
+    client->write_buffer_sent = 0;
+    client->write_buffer_capacity = INITIAL_WRITE_BUFFER_CAPACITY;
 
+    client->fd = fd;
     client->last_active_time = 0; // Will be set by server.c
     client->next = NULL;
     client->prev = NULL;
     
     g_clients[fd] = client; // Store it in our list of clients
-    
     return client;
+
+fail_write_buf:
+    free(client->read_buffer);
+fail_read_buf:
+    free(client);
+fail:
+    return NULL;
 }
 
 void client_free(Client* client) {
@@ -47,6 +52,10 @@ void client_free(Client* client) {
     // Free the buffer first
     if (client->read_buffer) {
         free(client->read_buffer);
+    }
+
+    if (client->write_buffer) {
+        free(client->write_buffer);
     }
     
     // Close the file descriptor
@@ -132,4 +141,49 @@ ClientReadResult client_read_data(Client* client) {
         client->read_buffer_len += bytes_read;
         
     }
+}
+
+/**
+ *  Queues a response to be sent to the client.
+ */
+int queue_client_response(Client* client, const char* msg) {
+    if (client == NULL || msg == NULL) return -1;
+
+    size_t msg_len = strlen(msg);
+    if (msg_len == 0) return 0; // Nothing to send
+
+    size_t new_total_len = client->write_buffer_len + msg_len;
+
+    if (new_total_len > client->write_buffer_capacity) {
+        size_t new_capacity = client->write_buffer_capacity;
+
+        // Keep doubling until it's big enough
+        while (new_total_len > new_capacity) {
+            new_capacity *= 2;
+        }
+        
+        // Check against our max buffer size
+        if (new_capacity > MAX_CLIENT_BUFFER_SIZE) {
+             new_capacity = MAX_CLIENT_BUFFER_SIZE;
+        }
+        
+        if (new_total_len > new_capacity) {
+             printf("(Client %d) ERROR: Write buffer limit exceeded\n", client->fd);
+             return -1; // OOM
+        }
+
+        char* new_buffer = realloc(client->write_buffer, new_capacity);
+        if (new_buffer == NULL) {
+            perror("realloc write_buffer");
+            return -1; 
+        }
+        client->write_buffer = new_buffer;
+        client->write_buffer_capacity = new_capacity;
+    }
+
+    memcpy(client->write_buffer + client->write_buffer_len, msg, msg_len);
+
+    client->write_buffer_len = new_total_len;
+
+    return 0; // Success
 }

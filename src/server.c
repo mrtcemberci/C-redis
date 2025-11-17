@@ -36,6 +36,7 @@ Client* g_timer_wheel[TIMER_WHEEL_SLOTS] = {0}; // O(1) idle client reaper
 void handle_new_connection(int listener_fd);
 void handle_client_event(int client_fd);
 void handle_client_disconnect(Client* client);
+void handle_client_write(int client_fd);
 void process_commands_in_buffer(Client* client);
 void execute_command(Client* client, Command* cmd, ParseResult parse_status);
 
@@ -93,21 +94,24 @@ int main(void) {
 
         for (int i = 0; i < n_ready; i++) {
             int fd = events[i].data.fd;
+            uint32_t e = events[i].events; 
 
             if (fd == listener_fd) {
-                // The listener socket is awake, could be a new connection
                 handle_new_connection(listener_fd);
             } else {
-                // Existing client message
-                
-                // TODO: Check for EPOLLOUT for writing
-                
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    // Error on the socket
+                // Check for errors first
+                if (e & (EPOLLERR | EPOLLHUP)) {
                     printf("(Server) Error on socket fd %d\n", fd);
                     handle_client_disconnect(client_get(fd));
+                    continue; // Skip other checks
                 }
-                else if (events[i].events & EPOLLIN) {
+                
+                if (e & EPOLLOUT) {
+                    // Data to write
+                    handle_client_write(fd);
+                }
+
+                if (e & EPOLLIN) {
                     // Data to read
                     handle_client_event(fd);
                 }
@@ -304,107 +308,168 @@ void process_commands_in_buffer(Client* client) {
  */
 void execute_command(Client* client, Command* cmd, ParseResult parse_status) {
     char response_buffer[RESPONSE_BUFFER_SIZE];
+    const char* response_msg = NULL; // The final message to send
 
+    //  Check if the parser failed
     if (parse_status != PARSE_SUCCESS) {
-        const char* error_msg;
         if (parse_status == PARSE_ERROR_UNCLOSED_QUOTE) {
-            error_msg = "(error) Protocol error: unclosed quote\n";
+            response_msg = "(error) Protocol error: unclosed quote\n";
         } else if (parse_status == PARSE_ERROR_TOO_MANY_ARGS) {
-            error_msg = "(error) Protocol error: too many arguments\n";
+            response_msg = "(error) Protocol error: too many arguments\n";
         } else {
-            error_msg = "(error) Protocol error: invalid syntax\n";
+            response_msg = "(error) Protocol error: invalid syntax\n";
         }
-        // Write back the clients socket the error 
-        write(client->fd, error_msg, strlen(error_msg));
-        return;
+        printf("(Client %d) Parse Error: %s", client->fd, response_msg);
+        goto queue_response; // Send the error
     }
 
-    // Check for an empty line
+    //  Check for an empty line
     if (cmd->argc == 0) {
-        goto reset_timer;
+        timer_wheel_remove(client); // Valid activity
+        timer_wheel_add(client);
+        return; // No response needed
     }
     
-    // Process "SET" command
+    //  Process "SET" command
     if (strcasecmp(cmd->argv[0], "SET") == 0) {
         if (cmd->argc != 3) {
-            const char* error_msg = "(error) ERR wrong number of arguments for 'set' command\n";
-            write(client->fd, error_msg, strlen(error_msg));
-            return;
+            response_msg = "(error) ERR wrong number of arguments for 'set' command\n";
+            goto queue_response;
         }
-
-        printf("(Client %d) EXEC: SET %s = %s\n", client->fd, cmd->argv[1], cmd->argv[2]);
         
         if (hashmap_set(g_database, cmd->argv[1], cmd->argv[2]) == 0) {
-            const char* ok_msg = "OK\n";
-            write(client->fd, ok_msg, strlen(ok_msg));
+            printf("(Client %d) EXEC: SET %s = ...\n", client->fd, cmd->argv[1]);
+            response_msg = "OK\n";
         } else {
-            const char* error_msg = "(error) ERR failed to set key\n";
-            write(client->fd, error_msg, strlen(error_msg));
+            response_msg = "(error) ERR failed to set key (OOM)\n";
         }
-        goto reset_timer;
+        goto reset_timer_and_queue;
     }
 
     //  Process "GET" command
     if (strcasecmp(cmd->argv[0], "GET") == 0) {
         if (cmd->argc != 2) {
-            const char* error_msg = "(error) ERR wrong number of arguments for 'get' command\n";
-            write(client->fd, error_msg, strlen(error_msg));
-            return;
+            response_msg = "(error) ERR wrong number of arguments for 'get' command\n";
+            goto queue_response;
         }
-
-        printf("(Client %d) EXEC: GET %s\n", client->fd, cmd->argv[1]);
         
+        printf("(Client %d) EXEC: GET %s\n", client->fd, cmd->argv[1]);
         const char* val = hashmap_get(g_database, cmd->argv[1]);
         
         if (val == NULL) {
-            const char* nil_msg = "(nil)\n";
-            write(client->fd, nil_msg, strlen(nil_msg));
+            response_msg = "(nil)\n";
         } else {
-            // Format the string response: "$<len>\r\n<value>\r\n"
-            // For our simple protocol, we'll just send: "\"<value>\"\n"
+            // Format the string response
             int len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE, "\"%s\"\n", val);
-            if (len >= RESPONSE_BUFFER_SIZE) {
-                // Value was too large for our response buffer
-                const char* error_msg = "(error) ERR value too large to send\n";
-                write(client->fd, error_msg, strlen(error_msg));
+            if (len < 0 || (size_t)len >= RESPONSE_BUFFER_SIZE) {
+                response_msg = "(error) ERR value too large to send\n";
             } else {
-                write(client->fd, response_buffer, len);
+                // It fit, so we use the stack buffer
+                response_msg = response_buffer;
             }
         }
-        goto reset_timer;
+        goto reset_timer_and_queue;
     }
     
     // Process "DEL" command
     if (strcasecmp(cmd->argv[0], "DEL") == 0) {
         if (cmd->argc != 2) {
-            const char* error_msg = "(error) ERR wrong number of arguments for 'del' command\n";
-            write(client->fd, error_msg, strlen(error_msg));
-            return;
+            response_msg = "(error) ERR wrong number of arguments for 'del' command\n";
+            goto queue_response;
         }
-
+        
         printf("(Client %d) EXEC: DEL %s\n", client->fd, cmd->argv[1]);
-        
         hashmap_delete(g_database, cmd->argv[1]);
-        
-        // Return the number of keys deleted
-        const char* ok_msg = "(integer) 1\n";
-        write(client->fd, ok_msg, strlen(ok_msg));
-        goto reset_timer;
+        response_msg = "(integer) 1\n";
+        goto reset_timer_and_queue;
     }
 
+    //  Unknown command
     printf("(Client %d) Unknown command: %s\n", client->fd, cmd->argv[0]);
-
-    // Unknown command
     int len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE, 
                        "(error) ERR unknown command '%s'\n", cmd->argv[0]);
-    write(client->fd, response_buffer, len);
+    if (len > 0 && (size_t)len < RESPONSE_BUFFER_SIZE) {
+        response_msg = response_buffer;
+    } else {
+        response_msg = "(error) ERR unknown command\n";
+    }
+    // Do not reset timer for unknown commands
+    goto queue_response;
 
-    return;
 
-reset_timer:
-    // This is a valid, active client. Reset their idle timer.
+reset_timer_and_queue:
     timer_wheel_remove(client);
     timer_wheel_add(client);
+
+queue_response:
+    if (response_msg != NULL) {
+        if (queue_client_response(client, response_msg) == -1) {
+            // OOM trying to queue response. Disconnect them.
+            printf("(Server) Client %d: OOM on write queue. Disconnecting.\n", client->fd);
+            handle_client_disconnect(client);
+            return;
+        }
+    }
+    
+    struct epoll_event event;
+    event.data.fd = client->fd;
+    event.events = EPOLLIN | EPOLLOUT | EPOLLET;
+    
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, client->fd, &event) < 0) {
+        perror("epoll_ctl MOD (add EPOLLOUT) failed");
+        handle_client_disconnect(client);
+    }
+}
+
+
+/*
+    Called when epoll says a client socket is ready to be WRITTEN TO
+*/
+void handle_client_write(int client_fd) {
+    Client* client = client_get(client_fd);
+    if (client == NULL) return;
+
+    size_t bytes_to_send = client->write_buffer_len - client->write_buffer_sent;
+    if (bytes_to_send == 0) {
+        // WE have no more bytes to send, tell epoll to F OFF!
+        goto stop_writing; 
+    }
+
+    // where to start sending
+    char* data_start = client->write_buffer + client->write_buffer_sent;
+
+    ssize_t bytes_written = write(client_fd, data_start, bytes_to_send);
+
+    if (bytes_written < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // Kernel buffer is full, write later
+            return; 
+        }
+        // A real error occurred
+        perror("write() failed");
+        handle_client_disconnect(client);
+        return;
+    }
+
+    // Update how much we've sent
+    client->write_buffer_sent += bytes_written;
+
+    // Check if we're done
+    if (client->write_buffer_sent == client->write_buffer_len) {
+        // We have sent everything, GOODBYE BUFFER
+        client->write_buffer_len = 0;
+        client->write_buffer_sent = 0;
+
+stop_writing: ;
+        struct epoll_event event;
+        event.data.fd = client_fd;
+        event.events = EPOLLIN | EPOLLET; // Go back to READ-ONLY
+        
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, client_fd, &event) < 0) {
+            perror("epoll_ctl MOD (remove EPOLLOUT) failed");
+            handle_client_disconnect(client);
+        }
+    }
 }
 
 /**

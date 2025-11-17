@@ -15,7 +15,11 @@ typedef struct Client {
     size_t read_buffer_len;
     size_t read_buffer_capacity;
     
-    // Add a write_buffer later for partial writes
+    // Dynamically growing write-buffer for partial writes 
+    char* write_buffer;
+    size_t write_buffer_len;      // Total bytes we need to send
+    size_t write_buffer_sent;     // How many bytes we've already sent
+    size_t write_buffer_capacity;
 
     /* Used in the linked list for the timer wheel for inactivity in server.c */
     time_t last_active_time;
@@ -50,5 +54,8 @@ Client* client_get(int fd);
 
 // Read data from the socket into the buffer
 ClientReadResult client_read_data(Client* client);
+
+// Queues a msg response in the client's buffer 
+int queue_client_response(Client* client, const char* msg);
 
 #endif // CLIENT_H
