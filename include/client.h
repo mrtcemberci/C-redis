@@ -19,6 +19,8 @@ typedef struct {
 } Client;
 
 #define MAX_CLIENTS 1024
+#define MAX_CLIENT_BUFFER_SIZE (1024 * 1024) /* 1 megabyte of data allowed maximum */
+
 extern Client* g_clients[MAX_CLIENTS];
 
 // Return codes for client_read_data

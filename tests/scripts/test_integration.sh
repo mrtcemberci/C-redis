@@ -1,3 +1,5 @@
+#This is a generic input test to test basic functionality
+
 set -e #exit if any command fails
 
 
@@ -13,20 +15,24 @@ trap "echo '--- Shutting Down Server ---'; kill $SERVER_PID" EXIT
 # Give the server a moment to start up
 sleep 0.5
 
+TEST_IN="tests/data/in/basic_test.in"
+TEST_EXPECTED="tests/data/expected/basic_test.expected"
+TEST_ACTUAL="tests/data/actual/basic_test.actual"
+
 # Simulate client, redirecte input into the netcat and redirect the output to the .actual file
-echo "--- Running Integration Test ---"
-cat tests/basic_test.in | netcat -w 1 localhost 6379 > tests/basic_test.actual
+echo "--- Running Integration Test (basic) ---"
+
+cat $TEST_IN | netcat -w 1 localhost 6379 > $TEST_ACTUAL
 
 echo "--- Comparing Results ---"
-if diff -q tests/basic_test.expected tests/basic_test.actual; then
-    echo "  PASSED: Output matches expected."
+if diff -q $TEST_EXPECTED $TEST_ACTUAL; then
+    echo "   PASSED: Output matches expected."
 else
     echo "  FAILED: Output MISMATCH!"
     echo "--- EXPECTED ---"
-    cat tests/basic_test.expected
-    echo ""
+    cat $TEST_EXPECTED
     echo "--- ACTUAL ---"
-    cat tests/basic_test.actual
+    cat $TEST_ACTUAL
     exit 1 
 fi
 

@@ -72,6 +72,16 @@ ClientReadResult client_read_data(Client* client) {
     
     while(1) {
         if (client->read_buffer_len == client->read_buffer_capacity) {
+
+            if (client->read_buffer_capacity >= MAX_CLIENT_BUFFER_SIZE) {
+                // This client is a spammer.
+                printf("(Client %d) ERROR: Buffer limit exceeded (%zu bytes)\n",
+                       client->fd, client->read_buffer_capacity);
+                // Send an error, then disconnect them.
+                const char* err = "(error) ERR command too large\n";
+                write(client->fd, err, strlen(err));
+                return READ_ERROR; // This will trigger a disconnect
+            }            
             
             size_t new_capacity = client->read_buffer_capacity * 2;
             
