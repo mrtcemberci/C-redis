@@ -4,6 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include "client.h"
+#include "io_backend.h" // Added for backend abstraction
 
 // Define the global clients list (initialized to NULL)
 Client* g_clients[MAX_CLIENTS] = {0};
@@ -58,8 +59,8 @@ void client_free(Client* client) {
         free(client->write_buffer);
     }
     
-    // Close the file descriptor
-    close(client->fd);
+    // Close the file descriptor via backend
+    g_backend->socket_close(client->fd);
     
     // Mark the slot in our array as free
     g_clients[client->fd] = NULL;
@@ -92,7 +93,9 @@ ClientReadResult client_read_data(Client* client) {
                        client->fd, client->read_buffer_capacity);
                 // Send an error, then disconnect them.
                 const char* err = "(error) ERR command too large\n";
-                write(client->fd, err, strlen(err));
+                
+                // Write via backend
+                g_backend->write(client->fd, err, strlen(err));
                 return READ_ERROR; // This will trigger a disconnect
             }            
             
@@ -118,8 +121,8 @@ ClientReadResult client_read_data(Client* client) {
         char* buffer_start = client->read_buffer + client->read_buffer_len;
         size_t space_left = client->read_buffer_capacity - client->read_buffer_len;
 
-        // Read from the socket
-        ssize_t bytes_read = read(client->fd, buffer_start, space_left);
+        // Read from the socket via backend
+        ssize_t bytes_read = g_backend->read(client->fd, buffer_start, space_left);
 
         if (bytes_read == 0) {
             // Client hung up
@@ -144,7 +147,7 @@ ClientReadResult client_read_data(Client* client) {
 }
 
 /**
- *  Queues a response to be sent to the client.
+ * Queues a response to be sent to the client.
  */
 int queue_client_response(Client* client, const char* msg) {
     if (client == NULL || msg == NULL) return -1;

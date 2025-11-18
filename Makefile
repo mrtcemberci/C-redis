@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -g -Wall -Wextra -std=gnu11 -Iinclude
 
 SERVER_EXE = redis-clone
-SERVER_SRCS = src/server.c src/network.c src/client.c src/parser.c src/hashmap.c
+SERVER_SRCS = src/server.c src/backend_epoll.c src/client.c src/parser.c src/hashmap.c
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 
 TEST_HASHMAP_EXE = test_hashmap
