@@ -48,8 +48,21 @@ void reap_idle_clients(void);
 void reap_ban_list(void);
 
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    // Default to Epoll
     g_backend = &epoll_backend;
+
+    // Check command line arguments for backend selection
+    if (argc > 1) {
+        if (strcasecmp(argv[1], "io_uring") == 0) {
+            g_backend = &iouring_backend;
+        } else if (strcasecmp(argv[1], "epoll") == 0) {
+            g_backend = &epoll_backend;
+        } else {
+            fprintf(stderr, "Usage: %s [epoll|io_uring]\n", argv[0]);
+            return 1;
+        }
+    }
 
     g_database = hashmap_create();
     g_ip_counts = hashmap_create();

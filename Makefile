@@ -1,8 +1,9 @@
 CC = gcc
-CFLAGS = -g -Wall -Wextra -std=gnu11 -Iinclude
+CFLAGS = -Wall -Wextra -O2 -Iinclude -D_GNU_SOURCE
+LDFLAGS = -luring 
 
 SERVER_EXE = redis-clone
-SERVER_SRCS = src/server.c src/backend_epoll.c src/client.c src/parser.c src/hashmap.c
+SERVER_SRCS = src/server.c src/backend/backend_epoll.c src/backend/backend_iouring.c src/client.c src/parser.c src/hashmap.c
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 
 TEST_HASHMAP_EXE = test_hashmap
@@ -43,7 +44,7 @@ server-test: $(SERVER_EXE)
 
 
 $(SERVER_EXE): $(SERVER_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(TEST_HASHMAP_EXE): $(TEST_HASHMAP_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -58,6 +59,6 @@ $(TEST_PARSER_EXE): $(TEST_PARSER_OBJS)
 # "make clean" - removes all build files and executables
 clean:
 	rm -f $(SERVER_EXE) $(TEST_HASHMAP_EXE) $(TEST_PARSER_EXE)
-	rm -f src/*.o tests/*.o
+	rm -f src/*.o tests/*.o src/backend/*.o
 	rm -f server.log
 	rm -f tests/data/actual/*

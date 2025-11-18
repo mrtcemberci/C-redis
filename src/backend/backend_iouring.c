@@ -2,21 +2,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h> 
 #include <errno.h>
 #include <string.h>
-#include <stdint.h> // Required for intptr_t
+#include <stdint.h>
+#include <liburing.h>
+#include <sys/poll.h>
+#include <sys/epoll.h> 
 
 #include "io_backend.h"
 
-static int g_epoll_fd = -1;
+#define URING_ENTRIES 256
+#define MAX_FDS 4096 
 
-// --- Forward Declarations ---
-// These tell the compiler about the functions before they are used
+static struct io_uring g_ring;
+
+struct WatchState {
+    int active;
+    uint32_t events;
+    void* user_data;
+};
+
+static struct WatchState g_watches[MAX_FDS];
+
 static int backend_init(void);
 static int backend_make_nonblocking(int fd);
 static int backend_socket_create_listener(int port);
@@ -30,29 +41,48 @@ static ssize_t backend_read(int fd, void* buf, size_t count);
 static ssize_t backend_write(int fd, const void* buf, size_t count);
 
 
-// --- Implementation Functions ---
+
+static void submit_poll_request(int fd) {
+    if (fd < 0 || fd >= MAX_FDS || !g_watches[fd].active) return;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
+    if (!sqe) return; // SQ Full, event dropped (robustness improvement needed for prod)
+
+    short poll_mask = 0;
+    if (g_watches[fd].events & IO_EVENT_READ) poll_mask |= POLLIN;
+    if (g_watches[fd].events & IO_EVENT_WRITE) poll_mask |= POLLOUT;
+    
+    poll_mask |= EPOLLET; 
+
+    io_uring_prep_poll_add(sqe, fd, poll_mask);
+    io_uring_sqe_set_data(sqe, (void*)(intptr_t)fd);
+}
+
+static void cancel_poll_request(int fd) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
+    if (!sqe) return;
+
+    io_uring_prep_cancel(sqe, (void*)(intptr_t)fd, 0);
+    io_uring_sqe_set_data(sqe, NULL); 
+    io_uring_submit(&g_ring);
+}
+
+
 
 static int backend_init(void) {
-    g_epoll_fd = epoll_create1(0);
-    if (g_epoll_fd < 0) {
-        perror("epoll_create1 failed");
+    if (io_uring_queue_init(URING_ENTRIES, &g_ring, 0) < 0) {
+        perror("io_uring_queue_init failed");
         return -1;
     }
-    printf("(Network) Epoll instance created (fd: %d)\n", g_epoll_fd);
+    memset(g_watches, 0, sizeof(g_watches));
+    printf("(Network) io_uring instance created\n");
     return 0;
 }
 
 static int backend_make_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) {
-        perror("fcntl(F_GETFL)");
-        return -1;
-    }
-
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        perror("fcntl(F_SETFL)");
-        return -1;
-    }
+    if (flags == -1) return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) return -1;
     return 0;
 }
 
@@ -91,8 +121,7 @@ static int backend_socket_create_listener(int port) {
         close(listener_fd);
         return -1;
     }
-
-    // This call is now safe because of the forward declaration above
+    
     if (backend_watch_add(listener_fd, IO_EVENT_READ, (void*)(intptr_t)listener_fd) < 0) {
         close(listener_fd);
         return -1;
@@ -122,65 +151,95 @@ static void backend_socket_close(int fd) {
 }
 
 static int backend_watch_add(int fd, int events, void* user_data) {
-    struct epoll_event ev;
-    ev.events = EPOLLET; 
-    if (events & IO_EVENT_READ) ev.events |= EPOLLIN;
-    if (events & IO_EVENT_WRITE) ev.events |= EPOLLOUT;
-    ev.data.ptr = user_data; 
+    if (fd >= MAX_FDS) return -1;
 
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        perror("epoll_ctl ADD failed");
-        return -1;
-    }
-    printf("(Network) Added fd %d to epoll\n", fd);
+    g_watches[fd].active = 1;
+    g_watches[fd].events = events;
+    g_watches[fd].user_data = user_data;
+
+    submit_poll_request(fd);
+    io_uring_submit(&g_ring);
+
+    printf("(Network) Added fd %d to io_uring\n", fd);
     return 0;
 }
 
 static int backend_watch_mod(int fd, int events, void* user_data) {
-    struct epoll_event ev;
-    ev.events = EPOLLET;
-    if (events & IO_EVENT_READ) ev.events |= EPOLLIN;
-    if (events & IO_EVENT_WRITE) ev.events |= EPOLLOUT;
-    ev.data.ptr = user_data;
+    if (fd >= MAX_FDS) return -1;
 
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0) {
-        perror("epoll_ctl MOD failed");
-        return -1;
-    }
+    cancel_poll_request(fd);
+
+    g_watches[fd].active = 1;
+    g_watches[fd].events = events;
+    g_watches[fd].user_data = user_data;
+
+    submit_poll_request(fd);
+    io_uring_submit(&g_ring);
+    
     return 0;
 }
 
 static int backend_watch_del(int fd) {
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL) < 0) {
-        perror("epoll_ctl DEL failed");
-    } else {
-        printf("(Network) Removed fd %d from epoll\n", fd);
+    if (fd >= MAX_FDS) return -1;
+
+    if (g_watches[fd].active) {
+        cancel_poll_request(fd);
+        g_watches[fd].active = 0;
+        printf("(Network) Removed fd %d from io_uring\n", fd);
     }
     return 0;
 }
 
 static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
-    struct epoll_event ep_events[max_events];
-    int n = epoll_wait(g_epoll_fd, ep_events, max_events, timeout_ms);
+    struct io_uring_cqe *cqe;
     
-    if (n < 0) return n; 
-
-    for (int i = 0; i < n; i++) {
-        events[i].user_data = ep_events[i].data.ptr;
-        events[i].events = 0;
-        
-        if (ep_events[i].events & (EPOLLERR | EPOLLHUP)) {
-            events[i].events |= IO_EVENT_ERROR;
-        }
-
-        if (ep_events[i].events & EPOLLIN) {
-             events[i].events |= IO_EVENT_READ;
-        }
-        if (ep_events[i].events & EPOLLOUT) {
-             events[i].events |= IO_EVENT_WRITE;
-        }
+    int ret;
+    if (timeout_ms == 0) {
+         ret = io_uring_peek_cqe(&g_ring, &cqe);
+    } else {
+         ret = io_uring_wait_cqe(&g_ring, &cqe);
     }
-    return n;
+
+    if (ret < 0) {
+        if (ret == -EAGAIN) return 0; 
+        return -1;
+    }
+
+    unsigned head;
+    int count = 0;
+
+    io_uring_for_each_cqe(&g_ring, head, cqe) {
+        if (count >= max_events) break;
+
+        int fd = (int)(intptr_t)cqe->user_data;
+
+        if (cqe->res >= 0) {
+            events[count].fd = fd;
+            events[count].events = 0;
+            
+            if (fd < MAX_FDS) {
+                events[count].user_data = g_watches[fd].user_data;
+            }
+
+            if (cqe->res & POLLIN)  events[count].events |= IO_EVENT_READ;
+            if (cqe->res & POLLOUT) events[count].events |= IO_EVENT_WRITE;
+            if (cqe->res & (POLLERR|POLLHUP)) events[count].events |= IO_EVENT_ERROR;
+
+            if (fd < MAX_FDS && g_watches[fd].active) {
+                submit_poll_request(fd);
+            }
+            
+            count++;
+        } 
+    }
+
+    io_uring_cq_advance(&g_ring, count);
+    
+    if (count > 0) {
+        io_uring_submit(&g_ring);
+    }
+
+    return count;
 }
 
 static ssize_t backend_read(int fd, void* buf, size_t count) {
@@ -191,9 +250,8 @@ static ssize_t backend_write(int fd, const void* buf, size_t count) {
     return write(fd, buf, count);
 }
 
-// --- The V-Table Definition ---
-IOBackend epoll_backend = {
-    .name = "epoll",
+IOBackend iouring_backend = {
+    .name = "io_uring",
     .init = backend_init,
     .socket_create_listener = backend_socket_create_listener,
     .socket_accept = backend_socket_accept,
