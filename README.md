@@ -7,7 +7,8 @@ Project was built to improve my skills and efficiency in low-level system progra
 - Server security and DoS attack mitigation
 
 # Core Architecture
-- Fully Asynchronous I/O: Uses epoll in Edge-Triggered (EPOLLET) mode for both EPOLLIN (reads) and EPOLLOUT (writes).
+- Pluggable Network Backend: Features a v-table based IOBackend abstraction (include/io_backend.h), allowing the event loop to be swapped at runtime. Includes implementations for epoll (default) and io_uring (using submission queues). New backends can be implemented by defining a new IOBackend struct.
+- Fully Asynchronous I/O: Uses Edge-Triggered notification for both reads and writes.
 - Custom Key-Value Store: A from-scratch, resizing HashMap built with separate-chaining, proven Valgrind-clean for zero memory leaks. Also features a custom iterator API.
 - Robust State-Machine Parser: A hand-written parser for a text protocol with full quote-support (e.g., SET "my key" "my value").
 - Dynamic Client Buffers: Client read (realloc) and write (queue_client_response) buffers are fully dynamic, handling partial/streamed network data and large responses without blocking.
@@ -34,7 +35,7 @@ Project was built to improve my skills and efficiency in low-level system progra
 - **make clean**: Cleans all executables, object files, and test artifacts.
 
 # How to run
-- Once compiled by **make**, run ./redis-clone
+- Once compiled by **make**, run ./redis-clone [epoll|io_uring] (defaults to epoll)
 - The server starts to listen on port 6379
 - You can try connecting as a client via 'netcat localhost 6379'
 - You can disconnect user-side by CTRL+C
