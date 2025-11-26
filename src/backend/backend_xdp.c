@@ -11,7 +11,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <net/if.h>
-#include <linux/if_packet.h> /* Essential: Defines the memory-mapped packet ring buffer structures (tpacket_req, etc.). */
+#include <linux/if_packet.h> 
 #include <linux/if_ether.h>  /* Defines Ethernet header constants (ETH_P_IP, ETH_ALEN). */
 #include <linux/ip.h>        /* Defines the IP header structure (struct iphdr). */
 #include <linux/tcp.h>       /* Defines the TCP header structure (struct tcphdr). */
@@ -24,25 +24,21 @@
 #include "io_backend.h"
 #include "client.h" 
 
-/* * ======================================================================================
+/* 
  * BACKEND_XDP (AF_PACKET V3 RX_RING + AF_INET RAW TX)
  * Robust Localhost Edition
  * ======================================================================================
- * * ARCHITECTURE EXPLAINED:
- * 1. RX (Receive): Uses AF_PACKET with a memory-mapped Ring Buffer. The kernel copies
+ * RX (Receive): Uses AF_PACKET with a memory-mapped Ring Buffer. The kernel copies
  * packets directly into a shared memory region, avoiding the overhead of 'recv()' syscalls.
- * 2. TX (Transmit): Uses AF_INET RAW sockets. We build the IP+TCP headers manually and
+ * TX (Transmit): Uses AF_INET RAW sockets. We build the IP+TCP headers manually and
  * inject them.
- * 3. Stack: Since we bypassed the kernel, we have to re-implement TCP (SYN, ACK, FIN, SEQ)
- * ourselves in userspace.
  */
 
 #define LISTEN_PORT        6379 /* The port we sniff traffic on. */
-#define FAKE_LISTENER_FD   99   /* A dummy File Descriptor ID to signal "New Connection" events to the server logic. */
-#define FAKE_FD_START      100  /* We don't use real FDs for clients. We map them to IDs starting at 100. */
+#define FAKE_LISTENER_FD   99   /* Dummy FD to signal a new connection */
+#define FAKE_FD_START      100  /* Fake FD Offset to prevent overlap with OS file descriptors */
 #define MAX_XDP_SESSIONS   (MAX_CLIENTS - FAKE_FD_START)
 
-// Ring Buffer Config - Increased for high throughput
 /* * The Ring Buffer is a circular array in memory shared between Kernel and User.
  * BLOCK_SIZE: Size of one block in the ring (must be page aligned).
  * FRAME_SIZE: Size of one packet slot (must be large enough for MTU + headers).
@@ -53,7 +49,6 @@
 #define FRAME_NR           (BLOCK_SIZE * BLOCK_NR / FRAME_SIZE)
 
 // Internal Buffers - 128KB to handle bursts
-/* We need a place to store TCP stream data until the application reads it. */
 #define SESSION_BUF_SIZE   131072
 
 /* Custom 8-bit TCP Flags */
@@ -90,7 +85,7 @@ typedef enum {
 typedef struct {
     int      id;            
     TcpState state;
-    uint32_t src_ip;        /* Client's IP */
+    uint32_t src_ip;        /* Client's IP, also localhost */
     uint32_t dst_ip;        /* Our IP (Localhost) */
     uint16_t src_port;      /* Client's Port */
     uint16_t dst_port;      /* Our Port */
@@ -100,12 +95,14 @@ typedef struct {
     uint32_t seq_num;       // SND.NXT (Next sequence number we will send)
     uint32_t ack_num;       // RCV.NXT (Next sequence number we expect to receive)
     
-    // Linear Buffers with Reset Logic
     /* A circular-ish buffer to hold payload data for the application layer. */
     char     rx_buf[SESSION_BUF_SIZE];
     size_t   rx_head;       // Read Ptr (App reads from here)
     size_t   rx_tail;       // Write Ptr (Network writes to here)
-    
+
+    size_t   rx_snapshot_len; /* The length of the block exposed to the server logic, prevents re-arm unseen data */
+    /* ^ this did not exist before and I spent a whole day debugging very strange race conditions :( */
+
     int      active;        /* Is this slot in use? */
     int      accepted;      /* Has the upper layer 'accept()'ed this connection? */
 } TcpSession;
@@ -121,13 +118,11 @@ static uint32_t   g_packet_count = 0; /* Counter for IP ID generation. */
 // Forward declarations
 static void handle_rx_packet(void *data, size_t len);
 
-/* ================== Packet Construction ================== */
-
 /*
  * Standard Internet Checksum algorithm (RFC 1071).
  * Used for IP headers. We sum 16-bit words, carry the overflow, and flip bits.
  */
-static uint16_t checksum(const void *data, int len) {
+static inline uint16_t checksum(const void *data, int len) {
     const uint16_t *ptr = data;
     uint32_t sum = 0;
     while (len > 1) { sum += *ptr++; len -= 2; }
@@ -141,75 +136,91 @@ static uint16_t checksum(const void *data, int len) {
  * Unlike IP, TCP requires a "Pseudo Header" (SrcIP, DstIP, Protocol, Length)
  * to be included in the checksum calculation to verify packet integrity relative to IP.
  */
-static uint16_t tcp_checksum(struct iphdr *iph, struct tcphdr *tcph, int len) {
-    struct __attribute__((packed)) pseudo_header {
-        uint32_t src_addr;
-        uint32_t dst_addr;
-        uint8_t  placeholder;
-        uint8_t  protocol;
-        uint16_t tcp_length;
-    } ps;
+static inline uint16_t tcp_checksum(struct iphdr *iph, struct tcphdr *tcph, int len) {
+    uint32_t sum = 0;
+    
+    // Source Address (4 bytes)
+    sum += (iph->saddr >> 16) & 0xFFFF;
+    sum += iph->saddr & 0xFFFF;
+    // Destination Address (4 bytes)
+    sum += (iph->daddr >> 16) & 0xFFFF;
+    sum += iph->daddr & 0xFFFF;
+    // Protocol (1 byte) + TCP Length (2 bytes) = 3 bytes, padded to 4.
+    sum += htons(IPPROTO_TCP);
+    sum += htons(len);
 
-    ps.src_addr = iph->saddr;
-    ps.dst_addr = iph->daddr;
-    ps.placeholder = 0;
-    ps.protocol = IPPROTO_TCP;
-    ps.tcp_length = htons(len);
+    // 2. Sum the entire TCP segment (TCP header + options + data)
+    const uint16_t *ptr = (const uint16_t *)tcph;
+    int remaining_len = len;
 
-    char buf[65535]; 
-    int psize = sizeof(struct pseudo_header) + len;
-    if ((size_t)psize > sizeof(buf)) return 0;
-
-    /* We copy the pseudo header and the actual TCP segment into a buffer to sum them. */
-    memcpy(buf, &ps, sizeof(struct pseudo_header));
-    memcpy(buf + sizeof(struct pseudo_header), tcph, len);
-
-    return checksum((uint16_t*)buf, psize);
-}
-
-// CRITICAL: Drain RX queue if TX is blocked
-/*
- * This is a vital function for stability.
- * If we get stuck trying to Send (TX), we must process Reads (RX).
- * Why? If the kernel's buffers fill up, it might block TX. If we stop reading RX
- * to wait for TX, we deadlock.
- */
-static void drain_rx_queue_internal(void) {
-    int processed = 0;
-    /* Process up to 64 packets per batch to avoid starving the CPU. */
-    while (processed < 64) { 
-        struct tpacket_hdr *tphdr = (struct tpacket_hdr *)g_ring_rd[g_ring_offset].iov_base;
-        
-        /* * TP_STATUS_USER means the frame belongs to us (Userspace).
-         * If it's TP_STATUS_KERNEL (0), there is no new packet yet.
-         */
-        if ((tphdr->tp_status & TP_STATUS_USER) == 0) {
-            break; 
-        }
-
-        /* Calculate pointer to the actual packet data within the frame. */
-        char *frame = (char*)tphdr;
-        struct sockaddr_ll *sll = (struct sockaddr_ll*)(frame + TPACKET_HDRLEN - sizeof(struct sockaddr_ll));
-        char *packet_data = frame + tphdr->tp_mac;
-        size_t len = tphdr->tp_len;
-
-        /* Ignore packets WE sent (OUTGOING), only process incoming. */
-        if (sll->sll_pkttype != PACKET_OUTGOING) {
-             handle_rx_packet(packet_data, len);
-        }
-
-        /* Release the frame back to the Kernel so it can put a new packet here. */
-        tphdr->tp_status = TP_STATUS_KERNEL; 
-        g_ring_offset = (g_ring_offset + 1) % FRAME_NR;
-        processed++;
+    while (remaining_len > 1) { 
+        sum += *ptr++; 
+        remaining_len -= 2; 
     }
+    // Handle the final odd byte if present
+    if (remaining_len > 0) { 
+        sum += *(const uint8_t *)ptr; 
+    }
+
+    // Fold the 32-bit sum down to 16 bits
+    while (sum >> 16) { 
+        sum = (sum & 0xFFFF) + (sum >> 16); 
+    }
+    
+    // Return the one's complement
+    return (uint16_t)~sum;
 }
 
 /*
- * Constructs and transmits a raw TCP/IP packet.
+ * The Core I-O function, checks the ring buffer for packets marked USER
+  processes in batches, uses pre-fetching to maximise throughput. 
+  Calls handle_rx_packet and returns the slot back to the kernel in the MMAP
+ */
+#define FRAME_MASK (FRAME_NR - 1)
+static inline void drain_rx_queue_internal(void) {
+    const int BATCH = 512;  // Tune: 64–256 usually optimal
+    int idx = g_ring_offset;
+
+    struct tpacket_hdr *tp;
+    char *frame;
+    struct sockaddr_ll *sll;
+    char *pdata;
+
+    for (int i = 0; i < BATCH; i++) {
+        tp = (struct tpacket_hdr *)g_ring_rd[idx].iov_base;
+
+        __builtin_prefetch(g_ring_rd[(idx + 4) & FRAME_MASK].iov_base, 0, 1);
+        __builtin_prefetch(g_ring_rd[(idx + 8) & FRAME_MASK].iov_base, 0, 1);
+
+        // No new packets → stop immediately.
+        if ((tp->tp_status & TP_STATUS_USER) == 0)
+            break;
+
+        frame = (char *)tp;
+        sll   = (struct sockaddr_ll *)(frame + TPACKET_HDRLEN - sizeof(struct sockaddr_ll));
+        pdata = frame + tp->tp_mac;
+
+        // Skip our own outgoing packets, process incoming only.
+        if (sll->sll_pkttype != PACKET_OUTGOING)
+            handle_rx_packet(pdata, tp->tp_len);
+
+        // Return this slot to the kernel, move forward
+        tp->tp_status = TP_STATUS_KERNEL;
+        idx++;
+        if (idx >= FRAME_NR)
+            idx = 0;
+    }
+
+    g_ring_offset = idx;
+}
+
+
+/*
+ * Another CORE I/O function
+ * Constructs and transmits a raw TCP/IP packet
  * We manually build: IP Header -> TCP Header -> Options -> Payload.
  */
-static void send_raw_packet(char *payload, size_t len, TcpSession *s, uint8_t flags) {
+static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uint8_t flags) {
     char frame[4096];
     memset(frame, 0, sizeof(frame));
 
@@ -280,6 +291,7 @@ static void send_raw_packet(char *payload, size_t len, TcpSession *s, uint8_t fl
     // We cannot drop packets in this stack or connection dies.
     /* * Since we don't have a retransmission queue (simplified stack), 
      * we CANNOT fail to send this packet. We must loop until successful.
+     * This should be improved for better throughput
      */
     while (1) { 
         sent = sendto(g_send_fd, frame, sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len, 
@@ -301,14 +313,12 @@ static void send_raw_packet(char *payload, size_t len, TcpSession *s, uint8_t fl
     }
     
     if (sent >= 0) {
-        DLOG("TX FD:%d Seq:%u Ack:%u Flags:%02X\n", s->id, seq_before, s->ack_num, flags);
+        //DLOG("TX FD:%d Seq:%u Ack:%u Flags:%02X\n", s->id, seq_before, s->ack_num, flags);
         /* Advance Sequence number: SYN and FIN consume 1 logical sequence number, Data consumes length. */
         if (len > 0) s->seq_num += len;
         else if (flags & (XDP_TCP_SYN | XDP_TCP_FIN)) s->seq_num++;
     }
 }
-
-/* ================== Micro-TCP Stack Logic ================== */
 
 /* Helper to find an existing session by Source IP/Port */
 static TcpSession* get_session(uint32_t saddr, uint16_t sport) {
@@ -345,7 +355,7 @@ static TcpSession* create_session(uint32_t saddr, uint16_t sport, uint32_t daddr
             return &g_sessions[i];
         }
     }
-    DLOG("Max sessions reached!\n");
+    //DLOG("Max sessions reached!\n");
     return NULL;
 }
 
@@ -377,7 +387,7 @@ static void handle_rx_packet(void *data, size_t len) {
     /* Calculate actual payload length: Total IP len - IP Header - TCP Header. */
     uint32_t seg_len = ntohs(iph->tot_len) - (iph->ihl*4) - (tcph->doff*4);
 
-    // --- SYN Handling (New Connection) ---
+    // SYN HANDLING
     if (tcph->syn && !tcph->ack) { 
         if (!sess) {
             /* Create new session structure. */
@@ -392,7 +402,7 @@ static void handle_rx_packet(void *data, size_t len) {
         } else {
             // Reuse/Retry Logic
             /* If we get a SYN for an existing session, it's a retry or a fast reuse. Reset. */
-            DLOG("SYN Retry/Reuse FD:%d\n", sess->id);
+            //DLOG("SYN Retry/Reuse FD:%d\n", sess->id);
             sess->ack_num = seq + 1;
             // Don't reset seq_num if retrying, but reset if reusing (hard to tell)
             // Simple logic: If SYN received, assume Client wants to start over.
@@ -410,7 +420,7 @@ static void handle_rx_packet(void *data, size_t len) {
     uint32_t header_len = sizeof(struct ethhdr) + (iph->ihl*4) + (tcph->doff*4);
     if (len < header_len) return;
     
-    // --- ACK Handling ---
+    // ACK HANDLING
     if (tcph->ack) {
         // We don't maintain a retransmit queue, so we just assume ACK is good.
         // Only thing: Check if handshake is done.
@@ -418,35 +428,45 @@ static void handle_rx_packet(void *data, size_t len) {
         if (sess->state == TCP_SYN_RCVD && !tcph->syn) {
             if (ack_seq == 1001) {
                 sess->state = TCP_ESTABLISHED;
-                DLOG("FD:%d ESTABLISHED\n", sess->id);
+                //DLOG("FD:%d ESTABLISHED\n", sess->id);
             }
         }
     }
 
-    // --- DATA Handling ---
+    // DATA Handling
     if (seg_len > 0) {
         // If duplicate data or retransmit?
         /* Strictly check SEQ to ensure in-order delivery. */
-        if (seq == sess->ack_num) {
+        if (seq == sess->ack_num) { 
+            uint32_t header_len = sizeof(struct ethhdr) + (iph->ihl*4) + (tcph->doff*4);
             char *payload = (char*)data + header_len;
-            size_t space = SESSION_BUF_SIZE - sess->rx_tail; // Simplified Linear check
             
-            // Reset if empty to avoid drift
-            /* If buffer is technically empty but pointers are at the end, reset to 0. */
-            if (sess->rx_head == sess->rx_tail) {
-                sess->rx_head = 0;
-                sess->rx_tail = 0;
-                space = SESSION_BUF_SIZE;
-            }
-
+            // CALCULATE SPACE
+            size_t data_in_buffer = sess->rx_tail - sess->rx_head;
+            size_t space = SESSION_BUF_SIZE - data_in_buffer;
+            
             if (seg_len <= space) {
-                /* Copy packet payload into session buffer for the App to read later. */
-                memcpy(sess->rx_buf + sess->rx_tail, payload, seg_len);
-                sess->rx_tail += seg_len;
+                //  CALCULATE PHYSICAL WRITE POSITION
+                size_t write_pos = sess->rx_tail % SESSION_BUF_SIZE;
+                
+                /* Check if data wraps around the end of the physical buffer */
+                size_t till_end = SESSION_BUF_SIZE - write_pos;
+                
+                if (seg_len <= till_end) {
+                    // Single contiguous write
+                    memcpy(sess->rx_buf + write_pos, payload, seg_len);
+                } else {
+                    // wraps around the circular buffer, write around both sides
+                    memcpy(sess->rx_buf + write_pos, payload, till_end);
+                    memcpy(sess->rx_buf, payload + till_end, seg_len - till_end);
+                }
+                
+                // ADVANCE ABSOLUTE TAIL POINTER
+                sess->rx_tail += seg_len; 
                 sess->ack_num = seq + seg_len; /* Update what we expect next */
-                // DLOG("FD:%d RX Data %u bytes\n", sess->id, seg_len);
+
             } else {
-                DLOG("FD:%d RX Buffer Full!\n", sess->id);
+                // Buffer Full
             }
         }
         // Always ACK (Cumulative ACK)
@@ -454,14 +474,14 @@ static void handle_rx_packet(void *data, size_t len) {
         send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
     }
     
-    // --- FIN Handling (Disconnect) ---
+    // FIN HANDLING
     if (tcph->fin) {
         if (seq == sess->ack_num) { // Only accept FIN if in order
-            DLOG("FD:%d RX FIN\n", sess->id);
+            //DLOG("FD:%d RX FIN\n", sess->id);
             sess->ack_num++; /* FIN consumes one sequence number */
             /* Send ACK+FIN. We are doing a fast close (Active Close + Passive Close combined). */
             send_raw_packet(NULL, 0, sess, XDP_TCP_ACK | XDP_TCP_FIN);
-            sess->state = TCP_CLOSE_WAIT; // App needs to read 0 to close
+            sess->state = TCP_CLOSE_WAIT; // App needs to read 0 to close, maintain consistency with the app
         } else {
             // Out of order FIN? ACK where we are.
             send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
@@ -469,14 +489,13 @@ static void handle_rx_packet(void *data, size_t len) {
     }
 }
 
-/* ================== Backend Implementation ================== */
 
 static int backend_init(void) {
-    /* 1. Create AF_PACKET socket for RX. This listens to Ethernet frames. */
+    /* Create AF_PACKET socket for RX. This listens to Ethernet frames. */
     g_raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (g_raw_fd < 0) { perror("socket AF_PACKET RX"); return -1; }
 
-    /* 2. Create AF_INET RAW socket for TX. This allows injecting IP packets. */
+    /*  Create AF_INET RAW socket for TX. This allows injecting IP packets. */
     g_send_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (g_send_fd < 0) { perror("socket RAW TX"); return -1; }
     
@@ -505,7 +524,7 @@ static int backend_init(void) {
     mreq.mr_type = PACKET_MR_PROMISC;
     setsockopt(g_raw_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
-    /* Prepare for Memory Mapped RX (TPACKET_V3/V2 logic). */
+    /* Prepare for Memory Mapped RX. */
     struct tpacket_req req;
     memset(&req, 0, sizeof(req));
     req.tp_block_size = BLOCK_SIZE;
@@ -518,7 +537,7 @@ static int backend_init(void) {
         perror("setsockopt PACKET_RX_RING"); return -1;
     }
 
-    /* Map the ring buffer into our process memory space. Zero-copy enabled! */
+    /* Map the ring buffer into our process memory space */
     size_t ring_size = (size_t)req.tp_block_nr * req.tp_block_size;
     g_ring_buffer = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_raw_fd, 0);
     if (g_ring_buffer == MAP_FAILED) { perror("mmap ring"); return -1; }
@@ -550,13 +569,14 @@ static int backend_init(void) {
  * This translates our custom Micro-TCP states into events the Server understands.
  */
 static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
+    (void)timeout_ms;
     // Always try to drain first
     /* Check for new packets from the network immediately. */
     drain_rx_queue_internal();
 
     int n = 0;
     
-    // 1. Report New Connections
+    // This reports new connections
     /* Scan session list for any connection that finished the Handshake but hasn't been Accept()'d. */
     for (int i=FAKE_FD_START; i<MAX_CLIENTS; i++) {
         if (g_sessions[i].active && g_sessions[i].state == TCP_ESTABLISHED && !g_sessions[i].accepted) {
@@ -569,7 +589,7 @@ static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
         }
     }
     
-    // 2. Report Data Available OR EOF
+    //  Report Data Available OR EOF
     /* Scan active sessions for data in their RX buffers or Close states. */
     for (int i = FAKE_FD_START; i < MAX_CLIENTS; i++) {
         if (!g_sessions[i].active) continue;
@@ -592,17 +612,8 @@ static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
         }
     }
     
-    // Sleep if nothing found, to be nice to CPU
-    /* Since we are polling memory (mmap), not blocking on syscalls, we must sleep manually to avoid 100% CPU usage. */
-    if (n == 0) {
-        usleep(10); 
-    }
-    
     return n;
 }
-
-/* Glue Layer */
-/* Functions below adapt the custom stack to the generic 'IOBackend' interface. */
 
 static int backend_socket_create_listener(int port) { (void)port; return FAKE_LISTENER_FD; }
 static int backend_socket_accept(int listener_fd, char* ip_buf, size_t ip_buf_len) {
@@ -643,34 +654,15 @@ static int backend_watch_mod(int fd, int events, void* user_data) { (void)fd; (v
 static int backend_watch_del(int fd) { (void)fd; return 0; }
 static int backend_make_nonblocking(int fd) { (void)fd; return 0; }
 
-/* Reads data from the internal linear session buffer. */
+/* Does nothing (not used in async server ) */
 static ssize_t backend_read(int fd, void* buf, size_t count) {
-    if (fd < FAKE_FD_START || fd >= MAX_CLIENTS) return -1;
-    TcpSession *s = &g_sessions[fd];
-    
-    size_t avail = s->rx_tail - s->rx_head;
-    
-    // If empty
-    if (avail == 0) { 
-        if (s->state == TCP_CLOSE_WAIT) {
-            return 0; // EOF!
-        }
-        errno = EAGAIN; return -1; 
-    }
-    
-    size_t to_read = (count < avail) ? count : avail;
-    /* Copy from internal buffer to user-provided buffer. */
-    memcpy(buf, s->rx_buf + s->rx_head, to_read);
-    s->rx_head += to_read;
-    
-    // Reset buffer to prevent drift if empty
-    /* If we consumed everything, reset pointers to start to maximize space. */
-    if (s->rx_head == s->rx_tail) {
-        s->rx_head = 0;
-        s->rx_tail = 0;
-    }
-    return to_read;
+    (void)fd;
+    (void)buf;
+    (void)count;
+
+    return 0;
 }
+
 
 /* Sends data by constructing PSH+ACK packets. */
 static ssize_t backend_write(int fd, const void* buf, size_t count) {
@@ -682,29 +674,62 @@ static ssize_t backend_write(int fd, const void* buf, size_t count) {
     return count;
 }
 
-/* Zero-copy read support (Async mode). Returns a pointer to internal buffer directly. */
+
+/* Tells the buf where the data is in the rx-ring by zero-copy principle */
 static int backend_get_read_buffer(int fd, BackendBuffer* buf) {
-    if (fd < FAKE_FD_START || fd >= MAX_CLIENTS) return -1;
+    if (fd < 0 || fd >= MAX_CLIENTS) return -1;
     TcpSession *s = &g_sessions[fd];
-    if (s->rx_head == s->rx_tail) { 
-        buf->data = NULL; buf->len = 0; buf->capacity = 0; 
-        return 0; 
+
+    // Total bytes available is the difference between absolute pointers
+    size_t avail = s->rx_tail - s->rx_head;
+
+    if (avail == 0) {
+        buf->data = NULL;
+        buf->len = 0;
+        buf->capacity = SESSION_BUF_SIZE;
+        s->rx_snapshot_len = 0;
+        return 0;
     }
-    buf->data = s->rx_buf + s->rx_head;
-    buf->len = s->rx_tail - s->rx_head;
-    buf->capacity = SESSION_BUF_SIZE;
+
+    // Physical buffer position of the read head
+    size_t read_pos = s->rx_head % SESSION_BUF_SIZE;
+
+    // The maximum contiguous segment is from the head position to the end of the physical buffer
+    size_t contiguous_len = SESSION_BUF_SIZE - read_pos;
+
+    // The exposed length is the smaller of total available data or the contiguous segment
+    size_t exposed_len = (avail < contiguous_len) ? avail : contiguous_len;
+
+    s->rx_snapshot_len = exposed_len; // Snapshot the length of the contiguous segment
+    
+    buf->data = s->rx_buf + read_pos;
+    buf->len = exposed_len;
+    // Remaining free space in the whole buffer
+    size_t data_in_buffer = s->rx_tail - s->rx_head;
+    buf->capacity = SESSION_BUF_SIZE - data_in_buffer;
+
     return 0;
 }
 
-/* Acknowledges that the async read buffer was consumed. */
+
+/* Finalizes zero-copy op and advanced the read pointer (head) */
 static int backend_re_arm_read(int fd) {
-    if (fd < FAKE_FD_START || fd >= MAX_CLIENTS) return -1;
+    if (fd < 0 || fd >= MAX_CLIENTS) return -1;
     TcpSession *s = &g_sessions[fd];
-    // Assume user consumed all data exposed in get_read_buffer
-    s->rx_head = s->rx_tail; 
-    if (s->rx_head == s->rx_tail) { s->rx_head = 0; s->rx_tail = 0; }
+
+    size_t to_consume = s->rx_snapshot_len;
+    
+    if (to_consume > 0) {
+        // Simply advance the absolute head pointer
+        s->rx_head += to_consume;
+        s->rx_snapshot_len = 0;
+    } else {
+        s->rx_snapshot_len = 0;
+    }
+
     return 0;
 }
+
 
 static ssize_t backend_submit_write(int fd, const void* buf, size_t count) {
     return backend_write(fd, buf, count);

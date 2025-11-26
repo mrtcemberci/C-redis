@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -Iinclude -D_GNU_SOURCE
+CFLAGS = -Wall -Wextra -Ofast -Iinclude -D_GNU_SOURCE
 LDFLAGS = -luring 
 
 SERVER_EXE = redis-clone

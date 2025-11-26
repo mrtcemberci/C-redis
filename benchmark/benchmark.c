@@ -9,7 +9,7 @@
 
 // CONFIGURATION
 #define NUM_THREADS 8
-#define DURATION_SEC 5 // How long each thread spams the command for
+#define DURATION_SEC 10 // How long each thread spams the command for
 #define SERVER_PORT 6379
 #define SERVER_IP "127.0.0.1" // localhost..
 
