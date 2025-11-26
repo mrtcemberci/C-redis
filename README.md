@@ -1,17 +1,30 @@
 # C-Redis (A Redis clone written in C)
 A simple, high-performance, in-memory key-value store built in C.
 Project was built to improve my skills and efficiency in low-level system programming, including:
-- High-performance asynchronous I/O with epoll
+- Kernel Bypass I/O: Implementing custom I/O stacks (e.g., XDP/Raw Sockets) for extreme speed.
+- High-performance asynchronous I/O, with tools like epoll and io_uring
 - Robust, stateful client management
 - Advanced C data structures and memory management
 - Server security and DoS attack mitigation
 
 # Core Architecture
-- Pluggable Network Backend: Features a v-table based IOBackend abstraction (include/io_backend.h), allowing the event loop to be swapped at runtime. Includes implementations for epoll (default) and io_uring (using submission queues). New backends can be implemented by defining a new IOBackend struct.
+-Pluggable Network Backend: Includes production-ready implementations for:
+  - epoll (Standard Linux high-performance I/O).
+  - io_uring (Kernel's advanced asynchronous interface).
+  - XDP-Lite / AF_PACKET v3: A custom user-space TCP stack leveraging memory-mapped ring buffers for zero-copy reading and kernel bypass for maximum throughput.
 - Fully Asynchronous I/O: Uses Edge-Triggered notification for both reads and writes.
 - Custom Key-Value Store: A from-scratch, resizing HashMap built with separate-chaining, proven Valgrind-clean for zero memory leaks. Also features a custom iterator API.
 - Robust State-Machine Parser: A hand-written parser for a text protocol with full quote-support (e.g., SET "my key" "my value").
 - Dynamic Client Buffers: Client read (realloc) and write (queue_client_response) buffers are fully dynamic, handling partial/streamed network data and large responses without blocking.
+
+# Benchmark
+- Performance testing on localhost loopback interface demonstrated the massive impact of low-level I/O and protocol optimisation.
+- You can run the benchmark by starting the server (following the guide below) and cd into the benchmark directory and running **make** to build the benchmark tool, you can configure the benchmark with the macros inside benchmark.c. Simply run with **/benchmark** with the server open.
+- Here are some stats from when I ran the benchmarks.
+Backend	  Run 1	  Run 2	  Run 3	  Average Throughput
+EPOLL	    139,368	141,527	132,832	137,909 RPS
+IO_URING	159,539	142,707	160,671	154,306 RPS
+XDP-Lite	179,142	180,819	192,435	184,132 RPS
 
 # Server Hardening & Security
 - The server is hardened against common Denial of Service (DoS) attacks
@@ -35,7 +48,7 @@ Project was built to improve my skills and efficiency in low-level system progra
 - **make clean**: Cleans all executables, object files, and test artifacts.
 
 # How to run
-- Once compiled by **make**, run ./redis-clone [epoll|io_uring] (defaults to epoll)
+- Once compiled by **make**, run ./redis-clone [epoll|io_uring|xdp] (defaults to epoll)
 - The server starts to listen on port 6379
 - You can try connecting as a client via 'netcat localhost 6379'
 - You can disconnect user-side by CTRL+C
