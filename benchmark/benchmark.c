@@ -9,7 +9,7 @@
 
 // CONFIGURATION
 #define NUM_THREADS 8
-#define DURATION_SEC 10 // How long each thread spams the command for
+#define DURATION_SEC 5 // How long each thread spams the command for
 #define SERVER_PORT 6379
 #define SERVER_IP "127.0.0.1" // localhost..
 
@@ -74,6 +74,12 @@ int main() {
     long long total_reqs = 0;
     for (int i = 0; i < NUM_THREADS; i++) {
         pthread_join(threads[i], NULL);
+
+        // Print per-thread stats
+        printf("Thread %d completed %lld requests\n",
+               stats[i].thread_id,
+               stats[i].requests_completed);
+
         total_reqs += stats[i].requests_completed;
     }
 

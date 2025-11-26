@@ -18,7 +18,7 @@
 #define RESPONSE_BUFFER_SIZE 1024 
 
 // Security rules
-#define IDLE_TIMEOUT_SECONDS 60
+#define IDLE_TIMEOUT_SECONDS 5
 #define TIMER_WHEEL_SLOTS (IDLE_TIMEOUT_SECONDS + 1) 
 #define RATE_LIMIT_WINDOW_SECONDS 60
 #define RATE_LIMIT_CONNECTIONS 100
@@ -62,8 +62,10 @@ int main(int argc, char *argv[]) {
             g_backend = &iouring_backend;
         } else if (strcasecmp(argv[1], "epoll") == 0) {
             g_backend = &epoll_backend;
+        } else if (strcasecmp(argv[1], "xdp") == 0) {
+            g_backend = &xdp_backend;
         } else {
-            fprintf(stderr, "Usage: %s [epoll|io_uring]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [epoll|io_uring|xdp]\n", argv[0]);
             return 1;
         }
     }
