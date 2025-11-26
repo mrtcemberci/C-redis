@@ -34,6 +34,9 @@
  * inject them.
  */
 
+ /* The receiving RX Path is zero-copy fully and incredibly fast, however the sending TX path is not..
+    For now it will remain this way. Maybe one day I can make it zero-copy if i get paid #quantlife */
+
 #define LISTEN_PORT        6379 /* The port we sniff traffic on. */
 #define FAKE_LISTENER_FD   99   /* Dummy FD to signal a new connection */
 #define FAKE_FD_START      100  /* Fake FD Offset to prevent overlap with OS file descriptors */
@@ -471,7 +474,11 @@ static void handle_rx_packet(void *data, size_t len) {
         }
         // Always ACK (Cumulative ACK)
         /* Send ACK immediately to keep window open. */
-        send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
+        // send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
+
+        // Changed this ^ to a delayed ACK, rather than sending an ACK
+        // on connection , we can send it alongside once we process the data from the connection.
+        // This somehow nearly doubled the throughput... strange
     }
     
     // FIN HANDLING
