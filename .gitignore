@@ -7,3 +7,4 @@ redis-clone
 *.d
 .DS_Store*~*.swp*.swo
 *.dSYM/
+.vscode

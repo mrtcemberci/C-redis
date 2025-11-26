@@ -6,6 +6,7 @@
 #include <time.h>
 #include <strings.h> 
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "hashmap.h"
 #include "parser.h"
@@ -34,12 +35,15 @@ Client* g_timer_wheel[TIMER_WHEEL_SLOTS] = {0};
 // Active Backend
 IOBackend* g_backend = NULL;
 
+bool g_is_async_mode = false;
+
 void handle_new_connection(int listener_fd);
 void handle_client_event(int client_fd);
 void handle_client_disconnect(Client* client);
 void handle_client_write(int client_fd);
 void process_commands_in_buffer(Client* client);
 void execute_command(Client* client, Command* cmd, ParseResult parse_status);
+void handle_new_connection_async(const IOEvent* ev);
 
 void timer_wheel_add(Client* client);
 void timer_wheel_remove(Client* client);
@@ -63,6 +67,8 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+
+    g_is_async_mode = (g_backend->is_async != 0);
 
     g_database = hashmap_create();
     g_ip_counts = hashmap_create();
@@ -106,27 +112,48 @@ int main(int argc, char *argv[]) {
         }
 
         for (int i = 0; i < n_ready; i++) {
-            int fd = (int)(intptr_t)events[i].user_data;
-            uint32_t e = events[i].events; 
+            IOEvent* ev = &events[i];
+            int fd = (int)(intptr_t)ev->user_data;
+            uint32_t e = ev->events;
 
-            if (fd == listener_fd) {
-                handle_new_connection(listener_fd);
+            if (!g_is_async_mode) {
+                /* Synchronous path (epoll) */
+                if (fd == listener_fd) {
+                    handle_new_connection(listener_fd);
+                } else {
+                    if (e & IO_EVENT_ERROR) {
+                        printf("(Server) Error on socket fd %d\n", fd);
+                        handle_client_disconnect(client_get(fd));
+                        continue;
+                    }
+                    if (e & IO_EVENT_WRITE) {
+                        handle_client_write(fd);
+                    }
+                    if (e & IO_EVENT_READ) {
+                        handle_client_event(fd);
+                    }
+                }
             } else {
-                // Check for errors first
-                if (e & IO_EVENT_ERROR) {
-                    printf("(Server) Error on socket fd %d\n", fd);
-                    handle_client_disconnect(client_get(fd));
-                    continue; // Skip other checks
-                }
-                
-                if (e & IO_EVENT_WRITE) {
-                    // Data to write
-                    handle_client_write(fd);
-                }
+                /* Async path (io_uring-style) */
+                int async_fd = ev->fd;
+                uint32_t ae  = ev->events;
 
-                if (e & IO_EVENT_READ) {
-                    // Data to read
-                    handle_client_event(fd);
+                if (async_fd == listener_fd && (ae & IO_EVENT_READ)) {
+                    /* New connection: ev->result contains the actual client_fd */
+                    handle_new_connection_async(ev);
+                } else {
+                    if (ae & IO_EVENT_ERROR) {
+                        handle_client_disconnect(client_get(async_fd));
+                        continue;
+                    }
+
+                    if (ae & IO_EVENT_WRITE) {
+                        handle_client_write(async_fd);
+                    }
+
+                    if (ae & IO_EVENT_READ) {
+                        handle_client_event(async_fd);
+                    }
                 }
             }
         }
@@ -147,6 +174,47 @@ int main(int argc, char *argv[]) {
     hashmap_free(g_ip_bans);
     g_backend->socket_close(listener_fd);
     return 0;
+}
+
+void handle_new_connection_async(const IOEvent* ev) {
+    int client_fd = (int)ev->result;  // result contains new client fd in async mode
+
+    if (client_fd < 0) {
+        fprintf(stderr, "(Server) Async accept error: %zd\n", ev->result);
+        return;
+    }
+
+    if (client_fd >= MAX_CLIENTS) {
+        fprintf(stderr, "Too many clients! Denying fd %d\n", client_fd);
+        g_backend->socket_close(client_fd);
+        return;
+    }
+
+    if (g_backend->socket_make_nonblocking(client_fd) < 0) {
+        g_backend->socket_close(client_fd);
+        return;
+    }
+
+    Client* new_client = client_create(client_fd);
+    if (new_client == NULL) {
+        fprintf(stderr, "Failed to create client for fd %d\n", client_fd);
+        g_backend->socket_close(client_fd);
+        return;
+    }
+
+    if (g_backend->watch_add(client_fd, IO_EVENT_READ, (void*)(intptr_t)client_fd) < 0) {
+        client_free(new_client);
+        return;
+    }
+
+    /* Arm the backend for a read operation for this FD */
+    if (g_backend->re_arm_read(client_fd) < 0) {
+        perror("re_arm_read (new async client)");
+        handle_client_disconnect(new_client);
+        return;
+    }
+
+    timer_wheel_add(new_client);
 }
 
 
@@ -236,19 +304,72 @@ void handle_new_connection(int listener_fd) {
 void handle_client_event(int client_fd) {
     Client* client = client_get(client_fd);
     if (client == NULL) {
-        // This happens if handle_client_write disconnected the client
-        // just before this event was processed. This is safe now.
         return;
     }
-    
-    ClientReadResult read_status = client_read_data(client);
-    
-    if (read_status == READ_DISCONNECTED || read_status == READ_ERROR) {
+
+    if (!g_is_async_mode) {
+        ClientReadResult read_status = client_read_data(client);
+
+        if (read_status == READ_DISCONNECTED || read_status == READ_ERROR) {
+            handle_client_disconnect(client);
+            return;
+        }
+
+        process_commands_in_buffer(client);
+        return;
+    }
+
+    /* ASYNC PATH*/
+
+    BackendBuffer buf;
+    if (g_backend->get_read_buffer(client_fd, &buf) < 0) {
+        return;
+    }
+
+
+    if (buf.len == 0) {
+        return; // no data, not EOF here
+    }
+
+    /*
+        This currently copies the backend buffer into the clients buffer,
+        for a true zero-copy way we can just parse from the buffer directly.
+        (TODO)
+    */
+
+    // Ensure client->read_buffer is large enough
+    size_t needed = client->read_buffer_len + buf.len;
+    if (needed > client->read_buffer_capacity) {
+        size_t new_cap = client->read_buffer_capacity ? client->read_buffer_capacity : 1024;
+        while (new_cap < needed) {
+            new_cap *= 2;
+        }
+
+        char* new_buf = realloc(client->read_buffer, new_cap);
+        if (!new_buf) {
+            perror("realloc in async read");
+            handle_client_disconnect(client);
+            return;
+        }
+        client->read_buffer = new_buf;
+        client->read_buffer_capacity = new_cap;
+    }
+
+    // Append new data
+    memcpy(client->read_buffer + client->read_buffer_len, buf.data, buf.len);
+    client->read_buffer_len += buf.len;
+
+    // Parse commands from buffer (same as sync path)
+    process_commands_in_buffer(client);
+
+    /*
+        This informs backend we are done with the data so arm the read
+    */
+    if (g_backend->re_arm_read(client_fd) < 0) {
+        perror("re_arm_read failed");
         handle_client_disconnect(client);
         return;
     }
-    
-    process_commands_in_buffer(client);
 }
 
 void process_commands_in_buffer(Client* client) {
@@ -303,7 +424,7 @@ void execute_command(Client* client, Command* cmd, ParseResult parse_status) {
         }
         
         if (hashmap_set(g_database, cmd->argv[1], cmd->argv[2]) == 0) {
-            printf("(Client %d) EXEC: SET %s = ...\n", client->fd, cmd->argv[1]);
+            //printf("(Client %d) EXEC: SET %s = ...\n", client->fd, cmd->argv[1]);
             response_msg = "OK\n";
         } else {
             response_msg = "(error) ERR failed to set key (OOM)\n";
@@ -317,7 +438,7 @@ void execute_command(Client* client, Command* cmd, ParseResult parse_status) {
             goto queue_response;
         }
         
-        printf("(Client %d) EXEC: GET %s\n", client->fd, cmd->argv[1]);
+        //printf("(Client %d) EXEC: GET %s\n", client->fd, cmd->argv[1]);
         const char* val = hashmap_get(g_database, cmd->argv[1]);
         
         if (val == NULL) {
@@ -339,13 +460,13 @@ void execute_command(Client* client, Command* cmd, ParseResult parse_status) {
             goto queue_response;
         }
         
-        printf("(Client %d) EXEC: DEL %s\n", client->fd, cmd->argv[1]);
+        //printf("(Client %d) EXEC: DEL %s\n", client->fd, cmd->argv[1]);
         hashmap_delete(g_database, cmd->argv[1]);
         response_msg = "(integer) 1\n";
         goto reset_timer_and_queue;
     }
 
-    printf("(Client %d) Unknown command: %s\n", client->fd, cmd->argv[0]);
+    //printf("(Client %d) Unknown command: %s\n", client->fd, cmd->argv[0]);
     int len = snprintf(response_buffer, RESPONSE_BUFFER_SIZE, 
                        "(error) ERR unknown command '%s'\n", cmd->argv[0]);
     if (len > 0 && (size_t)len < RESPONSE_BUFFER_SIZE) {
@@ -368,51 +489,107 @@ queue_response:
             return;
         }
     }
-    
-    // Modifying event via backend
-    if (g_backend->watch_mod(client->fd, IO_EVENT_READ | IO_EVENT_WRITE, (void*)(intptr_t)client->fd) < 0) {
-        perror("epoll_ctl MOD (add EPOLLOUT) failed");
-        handle_client_disconnect(client);
+
+    if (!g_is_async_mode) {
+        /* Modifies the watching for this FD to be ready for a write event too */
+        if (g_backend->watch_mod(client->fd,
+                                 IO_EVENT_READ | IO_EVENT_WRITE,
+                                 (void*)(intptr_t)client->fd) < 0) {
+            perror("watch_mod (add WRITE) failed");
+            handle_client_disconnect(client);
+        }
+    } else {
+        size_t bytes_to_send = client->write_buffer_len - client->write_buffer_sent;
+
+        if (bytes_to_send > 0) {
+            char* data_start = client->write_buffer + client->write_buffer_sent;
+
+            ssize_t submitted = g_backend->submit_write(client->fd,
+                                                        data_start,
+                                                        bytes_to_send);
+            if (submitted < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Backend cannot take more now; rely on a WRITE event later
+                    // or backend-internal queueing.
+                    return;
+                }
+                perror("submit_write failed");
+                handle_client_disconnect(client);
+                return;
+            }
+
+            client->write_buffer_sent += (size_t)submitted;
+
+            if (client->write_buffer_sent == client->write_buffer_len) {
+                // All queued data considered "accepted"/sent.
+                client->write_buffer_len = 0;
+                client->write_buffer_sent = 0;
+            }
+        }
+
     }
 }
-
 
 void handle_client_write(int client_fd) {
     Client* client = client_get(client_fd);
     if (client == NULL) return;
 
-    size_t bytes_to_send = client->write_buffer_len - client->write_buffer_sent;
-    if (bytes_to_send == 0) {
-        goto stop_writing; 
-    }
+    if (!g_is_async_mode) {
 
-    char* data_start = client->write_buffer + client->write_buffer_sent;
-
-    // Write via backend
-    ssize_t bytes_written = g_backend->write(client_fd, data_start, bytes_to_send);
-
-    if (bytes_written < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return; 
+        size_t bytes_to_send = client->write_buffer_len - client->write_buffer_sent;
+        if (bytes_to_send == 0) {
+            goto stop_writing;
         }
-        perror("write() failed");
-        handle_client_disconnect(client);
+
+        char* data_start = client->write_buffer + client->write_buffer_sent;
+
+        ssize_t bytes_written = g_backend->write(client_fd, data_start, bytes_to_send);
+
+        if (bytes_written < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return; // Try again later
+            }
+            perror("write() failed");
+            handle_client_disconnect(client);
+            return;
+        }
+
+        client->write_buffer_sent += (size_t)bytes_written;
+
+        if (client->write_buffer_sent == client->write_buffer_len) {
+            client->write_buffer_len = 0;
+            client->write_buffer_sent = 0;
+        }
+
+    stop_writing:
+        if (g_backend->watch_mod(client_fd,
+                                 IO_EVENT_READ,
+                                 (void*)(intptr_t)client_fd) < 0) {
+            perror("watch_mod (remove WRITE) failed");
+            handle_client_disconnect(client);
+        }
         return;
     }
 
-    client->write_buffer_sent += bytes_written;
+    /*
+     Assume that if the write is done we wrote everything for simplicity,
+     in production we check how much is actually sent and queue the rest to go.
+    */
 
     if (client->write_buffer_sent == client->write_buffer_len) {
+        // nothing left to send; ensure the buffer is reset
         client->write_buffer_len = 0;
         client->write_buffer_sent = 0;
-
-stop_writing: ;
-        // Modifying event via backend
-        if (g_backend->watch_mod(client_fd, IO_EVENT_READ, (void*)(intptr_t)client_fd) < 0) {
-            perror("epoll_ctl MOD (remove EPOLLOUT) failed");
-            handle_client_disconnect(client);
-        }
     }
+    
+    /* I commented this out because it may cause multiple re-arms, bad for efficiency. */
+
+    // // Re-arm read so we can receive the next command
+    // if (g_backend->re_arm_read(client_fd) < 0) {
+    //     perror("re_arm_read after write completion failed");
+    //     handle_client_disconnect(client);
+    //     return;
+    // }
 }
 
 void handle_client_disconnect(Client* client) {
