@@ -296,6 +296,7 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
      * we CANNOT fail to send this packet. We must loop until successful.
      * This should be improved for better throughput
      */
+    int retries = 0;
     while (1) { 
         sent = sendto(g_send_fd, frame, sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len, 
                       0, (struct sockaddr*)&sin, sizeof(sin));
@@ -306,7 +307,14 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
         if (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             // Congestion! Process RX to help clear buffers.
             drain_rx_queue_internal();
-            sched_yield(); 
+            if (retries < 1000) {
+                /* Busy wait to avoid calling sched yield */
+                retries++;
+            } else {
+                struct pollfd pfd = { .fd = g_send_fd, .events = POLLOUT };
+                poll(&pfd, 1, 1); 
+                retries = 0;
+            }
             continue;
         }
         
