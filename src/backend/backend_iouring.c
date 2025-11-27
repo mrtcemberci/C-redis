@@ -15,11 +15,10 @@
 #include "io_backend.h"
 
 #define MAX_FDS       4096
-// Match URING_ENTRIES to MAX_FDS to prevent ring overflows during massive bursts
+// Note: URING_ENTRIES should ideally be equal to MAX_FDS for fixed files
 #define URING_ENTRIES 4096 
 #define READ_BUF_INIT 4096
 
-// --- Compatibility Defines for Older liburing headers ---
 #ifndef IORING_SETUP_SINGLE_ISSUER
 #define IORING_SETUP_SINGLE_ISSUER (1U << 12)
 #endif
@@ -30,12 +29,12 @@
 #define IORING_SETUP_COOP_TASKRUN (1U << 14)
 #endif
 
+/* Globals */
 struct io_uring g_ring;
 int g_files_registered = 0; 
 int g_sqpoll_enabled = 0;
 
-/* Per-FD state */
-
+/* Per FD state */
 typedef enum {
     FD_TYPE_NONE = 0,
     FD_TYPE_LISTENER,
@@ -55,33 +54,39 @@ typedef struct {
     char* write_buf;
     size_t   write_len;
     ssize_t  last_write_res;
+    
+    // Tracking state for async close/cleanup
+    int      is_closing; 
 } FdState;
 
 static FdState g_fds[MAX_FDS];
 
 /* Tag encoding:
- * lower 2 bits = op:
- * 0 = poll, 1 = accept, 2 = read, 3 = write
+ * lower 3 bits = op: 0..7
  * upper bits = fd
  */
 
 static inline intptr_t make_tag(int fd, int op) {
-    return ((intptr_t)fd << 2) | (op & 0x3);
+    return ((intptr_t)fd << 3) | (op & 0x7);
 }
 
 static inline void decode_tag(intptr_t tag, int* fd, int* op) {
-    *fd = (int)(tag >> 2);
-    *op = (int)(tag & 0x3);
+    *fd = (int)(tag >> 3);
+    *op = (int)(tag & 0x7);
 }
 
+// Resets the struct state only; memory free must happen before this.
 static void fdstate_reset(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return;
     FdState* st = &g_fds[fd];
-    if (st->read_buf) free(st->read_buf);
-    memset(st, 0, sizeof(*st));
+    
+    // We rely on the CQE handler to free st->read_buf.
+    memset(st, 0, sizeof(*st)); 
     st->type = FD_TYPE_NONE;
 }
 
+static int submit_accept_request(int listener_fd);
+static int submit_read_request(int fd);
 static int      backend_init(void);
 static int      backend_make_nonblocking(int fd);
 static int      backend_socket_create_listener(int port);
@@ -93,13 +98,12 @@ static int      backend_watch_del(int fd);
 static int      backend_poll(IOEvent* events, int max_events, int timeout_ms);
 static ssize_t  backend_read(int fd, void* buf, size_t count);
 static ssize_t  backend_write(int fd, const void* buf, size_t count);
-
 static int      backend_get_read_buffer(int fd, BackendBuffer* buf);
 static int      backend_re_arm_read(int fd);
 static ssize_t  backend_submit_write(int fd, const void* buf, size_t count);
 
 
-/* Asks the kernel to notify us when this fd is ready to read/write */
+/* Submits a request with tag 0 (Poll)*/
 static void submit_poll_request(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return;
     FdState* st = &g_fds[fd];
@@ -112,6 +116,8 @@ static void submit_poll_request(int fd) {
     if (st->interests & IO_EVENT_READ)  mask |= POLLIN;
     if (st->interests & IO_EVENT_WRITE) mask |= POLLOUT;
 
+    /* This adds the sqe entry into the SQ */
+    /* All additions are in user space and NOT sent to the kernel until we submit the ring */
     io_uring_prep_poll_add(sqe, fd, mask);
     io_uring_sqe_set_data(sqe, (void*)make_tag(fd, 0));
 
@@ -120,7 +126,7 @@ static void submit_poll_request(int fd) {
     }
 }
 
-/* Async accept op, used for new connection */
+/* Submits a request with tag 1 (new connection/accept) */
 static int submit_accept_request(int listener_fd) {
     struct io_uring_sqe* sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return -1;
@@ -128,13 +134,14 @@ static int submit_accept_request(int listener_fd) {
     io_uring_prep_accept(sqe, listener_fd, NULL, NULL, 0);
     io_uring_sqe_set_data(sqe, (void*)make_tag(listener_fd, 1));
 
+    /* Tell the SQE to use registered fixed files */
     if (g_files_registered) {
         sqe->flags |= IOSQE_FIXED_FILE;
     }
     return 0;
 }
 
-/* Prepare an async read, tells the kernel to read data into the st->read_buf */
+/* Submits a request with tag 2 (read) */
 static int submit_read_request(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return -1;
     FdState* st = &g_fds[fd];
@@ -142,6 +149,7 @@ static int submit_read_request(int fd) {
 
     if (!st->read_buf || st->read_cap == 0) {
         st->read_cap = READ_BUF_INIT;
+        /* This is freed in the poll loop after backend watch del is called */
         st->read_buf = malloc(st->read_cap);
         if (!st->read_buf) {
             perror("malloc read_buf");
@@ -153,6 +161,7 @@ static int submit_read_request(int fd) {
     struct io_uring_sqe* sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return -1;
 
+    /* Tell the kernel to read the data into this buffer */
     io_uring_prep_read(sqe, fd, st->read_buf, st->read_cap, 0);
     io_uring_sqe_set_data(sqe, (void*)make_tag(fd, 2));
 
@@ -162,7 +171,7 @@ static int submit_read_request(int fd) {
     return 0;
 }
 
-/* Submits a write request, tells kernel to send data from the write_buf */
+/* Submits a write request to the kernel(tag 3) */
 static int submit_write_request(int fd, const void* buf, size_t count) {
     if (fd < 0 || fd >= MAX_FDS) return -1;
     FdState* st = &g_fds[fd];
@@ -175,6 +184,8 @@ static int submit_write_request(int fd, const void* buf, size_t count) {
     struct io_uring_sqe* sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return -1;
 
+    /* This buffer is managed by the server and is freed AFTER submitting a watch del request ONLY 
+      so it is safe for the kernel to write its contents to the FD */
     io_uring_prep_write(sqe, fd, st->write_buf, st->write_len, 0);
     io_uring_sqe_set_data(sqe, (void*)make_tag(fd, 3));
 
@@ -184,45 +195,26 @@ static int submit_write_request(int fd, const void* buf, size_t count) {
     return 0;
 }
 
-/* Backend core */
-
 static int backend_init(void) {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
     int ret = -1;
 
-    /* Optimisation flags */
+    /* Attempt advanced optimization flags first */
     params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
     params.sq_thread_idle = 2000;
     
     ret = io_uring_queue_init_params(URING_ENTRIES, &g_ring, &params);
     
-    if (ret == 0) {
-        g_sqpoll_enabled = 1;
-        printf("(Network) io_uring created in GOD MODE (SQPOLL + SingleIssuer + DeferTaskRun)\n");
-    } else {
-        /* Top-level optimisation failed, trying next level */
+    if (ret != 0) {
+        /* Fallback to classic SQPOLL */
         memset(&params, 0, sizeof(params));
         params.flags = IORING_SETUP_SQPOLL;
         params.sq_thread_idle = 2000;
-        
         ret = io_uring_queue_init_params(URING_ENTRIES, &g_ring, &params);
-        if (ret == 0) {
-            g_sqpoll_enabled = 1;
-            printf("(Network) io_uring created in SQPOLL Mode (Classic)\n");
-        } else {
-            // Standard
-            memset(&params, 0, sizeof(params));
-            params.flags = IORING_SETUP_SINGLE_ISSUER;
-            
-            ret = io_uring_queue_init_params(URING_ENTRIES, &g_ring, &params);
-            if (ret == 0) {
-                 printf("(Network) io_uring created in Single-Issuer Mode\n");
-            } else {
-                 // Basic
-                 ret = io_uring_queue_init(URING_ENTRIES, &g_ring, 0);
-                 if (ret == 0) printf("(Network) io_uring created in Standard Mode\n");
-            }
+        if (ret != 0) {
+            // Basic Standard fallback
+            ret = io_uring_queue_init(URING_ENTRIES, &g_ring, 0);
         }
     }
 
@@ -231,10 +223,16 @@ static int backend_init(void) {
         perror("io_uring_queue_init failed");
         return -1;
     }
+    
+    if (ret == 0) {
+        if (params.flags & IORING_SETUP_SQPOLL) g_sqpoll_enabled = 1;
+        printf("(Network) io_uring initialized (Mode: %s)\n", 
+               (g_sqpoll_enabled) ? "SQPOLL" : "Standard");
+    }
 
     memset(g_fds, 0, sizeof(g_fds));
 
-    /* Registers files to implement a fixed filet able rather than lookup in the process table */
+    /* Fixed File Table Registration */
     int* register_buf = malloc(MAX_FDS * sizeof(int));
     if (register_buf) {
         for (int i = 0; i < MAX_FDS; i++) register_buf[i] = -1;
@@ -243,7 +241,7 @@ static int backend_init(void) {
         free(register_buf);
 
         if (ret < 0) {
-            fprintf(stderr, "(Network) Warning: Failed to register files (%d).\n", ret);
+            fprintf(stderr, "(Network) Warning: Failed to register files (%d). Performance will be reduced.\n", ret);
             g_files_registered = 0;
         } else {
             g_files_registered = 1;
@@ -331,7 +329,7 @@ static int backend_socket_create_listener(int port) {
     return listener_fd;
 }
 
-/* Done to retriev the IP Address, is blocking because it uses accept */
+/* Writes the fd IP into the requested buffer and returns the FD, SYNC */
 static int backend_socket_accept(int listener_fd, char* ip_buf, size_t ip_buf_len) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -350,14 +348,12 @@ static int backend_socket_accept(int listener_fd, char* ip_buf, size_t ip_buf_le
     return client_fd;
 }
 
+/* Stop listening and clean up resources for the FD */
 static void backend_socket_close(int fd) {
-    if (fd < 0 || fd >= MAX_FDS) return;
     backend_watch_del(fd);
-    close(fd);
-    fdstate_reset(fd);
 }
 
-/* Registers new FD in the fixed file table and queues polling */
+/* Start a watching for the fd */
 static int backend_watch_add(int fd, int events, void* user_data) {
     if (fd < 0 || fd >= MAX_FDS) return -1;
     FdState* st = &g_fds[fd];
@@ -365,6 +361,7 @@ static int backend_watch_add(int fd, int events, void* user_data) {
     st->active    = 1;
     st->interests = events;
     st->user_data = user_data;
+    st->is_closing = 0;
 
     if (st->type == FD_TYPE_NONE) {
         st->type = FD_TYPE_CLIENT;
@@ -390,7 +387,7 @@ static int backend_watch_add(int fd, int events, void* user_data) {
     return 0;
 }
 
-/* Modifies the event we are looking for */
+/* Modifies the FDs watch event to the given event */
 static int backend_watch_mod(int fd, int events, void* user_data) {
     if (fd < 0 || fd >= MAX_FDS) return -1;
     FdState* st = &g_fds[fd];
@@ -414,38 +411,57 @@ static int backend_watch_mod(int fd, int events, void* user_data) {
     return 0;
 }
 
-/* Kills a client, kicks it off the ring and removes FD from the fixed table */
+/* Tells the kernel to free the resources and close the fd */
 static int backend_watch_del(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return -1;
     FdState* st = &g_fds[fd];
 
-    if (!st->active) return 0;
+    /* Prevent double closing */
+    if (st->is_closing) {
+        return 0;
+    }
 
-    st->active    = 0;
+    // Mark as closing so we don't come back here
+    st->active = 0;
+    st->is_closing = 1; 
+
+    int should_submit = 0;
+
+    // Submit CANCEL for pending READ (op=2)
+    struct io_uring_sqe* sqe_cancel = io_uring_get_sqe(&g_ring);
+    if (sqe_cancel) {
+        io_uring_prep_cancel(sqe_cancel, (void*)make_tag(fd, 2), 0);
+        if (g_files_registered) {
+            sqe_cancel->flags |= IOSQE_FIXED_FILE;
+        }
+        should_submit = 1; 
+    }
+    
+    // Submit ASYNCHRONOUS CLOSE (op=5)
+    struct io_uring_sqe* sqe_close = io_uring_get_sqe(&g_ring);
+    if (sqe_close) {
+        io_uring_prep_close(sqe_close, fd); 
+        io_uring_sqe_set_data(sqe_close, (void*)make_tag(fd, 5)); 
+
+        //printf("(Network) Submitted final FD close for fd %d\n", fd);
+        
+        should_submit = 1; 
+    }
+    
     st->interests = 0;
     st->user_data = NULL;
-
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&g_ring);
-    if (sqe) {
-        io_uring_prep_cancel(sqe, (void*)make_tag(fd, 0), IORING_ASYNC_CANCEL_ALL);
-        io_uring_sqe_set_data(sqe, NULL);
+    
+    if (should_submit) {
         io_uring_submit(&g_ring);
-    }
+    } 
 
-    if (g_files_registered) {
-        int minus_one = -1;
-        io_uring_register_files_update(&g_ring, fd, &minus_one, 1);
-    }
-
-    printf("(Network) Removed fd %d from io_uring\n", fd);
     return 0;
 }
 
+/* Main logic , polls the completion queue and populates event array */
 static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
     (void)timeout_ms;
 
-    /* Processes request once a poll in a batch system, greatly improved throughput
-     (90k -> 130k )*/
     int sret = io_uring_submit(&g_ring);
     if (sret < 0) {
         errno = -sret;
@@ -463,26 +479,77 @@ static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
     }
 
     unsigned head;
-    int count = 0;
+    int count = 0; // Counts events generated for server.c
+    int cqe_processed_count = 0; // Counts total CQEs consumed
 
     /* Loops through completion queue , populates IOEvent array for server.c */
     io_uring_for_each_cqe(&g_ring, head, cqe) {
-        if (count >= max_events) break;
-
+        
         intptr_t tag = (intptr_t)io_uring_cqe_get_data(cqe);
         int fd, op;
         decode_tag(tag, &fd, &op);
 
         if (fd < 0 || fd >= MAX_FDS) {
+            cqe_processed_count++;
             continue;
         }
 
         FdState* st = &g_fds[fd];
+        
+        // No event generation, handles clean up only
+        
+        if (op == 2) { 
+            if (cqe->res == -ECANCELED || cqe->res == -ENOENT) { 
+                
+                if (st->is_closing) {
+                    //  FREE DYNAMIC MEMORY
+                    if (st->read_buf) {
+                        free(st->read_buf);
+                        st->read_buf = NULL; 
+                    }
+                    fdstate_reset(fd); 
+                    
+                    //printf("(Network) Confirmed async memory free for fd %d\n", fd);
+                } 
+                cqe_processed_count++;
+                continue;
+            }           
+        } else if (op == 5) { 
+            //printf("(Network) Final FD release completion for fd %d, res: %d\n", fd, cqe->res);
+            
+            if (g_files_registered) {
+                int minus_one = -1;
+                // NOW it is safe to remove the index mapping
+                if (io_uring_register_files_update(&g_ring, fd, &minus_one, 1) < 0) {
+                     perror("io_uring_register_files_update (cleanup)");
+                } else {
+                     //printf("(Network) Unregistered fixed file index %d\n", fd);
+                }
+            } else {
+                // If not using fixed files, the prep_close handled the actual close(fd)
+                // but we might check if it failed.
+                if (cqe->res < 0 && cqe->res != -EBADF) {
+                    fprintf(stderr, "Async close failed: %d\n", cqe->res);
+                }
+            }
 
-        if (!st->active) {
+            // Reset state
+            fdstate_reset(fd);
+            
+            cqe_processed_count++;
             continue;
         }
+        
+        // If the slot is closing, skip application logic (but still count the CQE)
+        if (st->is_closing) {
+             cqe_processed_count++;
+             continue;
+        }
 
+        if (count >= max_events) {
+            break; 
+        }
+            
         IOEvent* ev = &events[count];
         ev->fd        = fd;
         ev->user_data = st->user_data;
@@ -515,7 +582,7 @@ static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
             }
 
         } else if (op == 2) {
-            /* READ completion */
+            /* READ completion (normal read) */
             if (cqe->res <= 0) {
                 st->read_len = 0;
                 ev->events   |= IO_EVENT_ERROR;
@@ -535,9 +602,11 @@ static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
         }
 
         count++;
+        cqe_processed_count++;
     }
 
-    io_uring_cq_advance(&g_ring, count);
+    // Advance by the total number of CQEs processed
+    io_uring_cq_advance(&g_ring, cqe_processed_count);
     return count;
 }
 
@@ -564,8 +633,6 @@ static int backend_get_read_buffer(int fd, BackendBuffer* buf) {
     buf->data     = st->read_buf;
     buf->capacity = st->read_cap;
     buf->len      = st->read_len;
-
-
     return 0;
 }
 
@@ -592,5 +659,19 @@ static ssize_t backend_submit_write(int fd, const void* buf, size_t count) {
     return (ssize_t)count;
 }
 
-IOBackend iouring_backend = {.name                   = "io_uring",.is_async               = 1,.init                   = backend_init,.socket_create_listener = backend_socket_create_listener,.socket_accept          = backend_socket_accept,.socket_close           = backend_socket_close,.socket_make_nonblocking= backend_make_nonblocking,.watch_add              = backend_watch_add,.watch_mod              = backend_watch_mod,.watch_del              = backend_watch_del,.poll                   = backend_poll,.read                   = backend_read,.write                  = backend_write,.get_read_buffer        = backend_get_read_buffer,.re_arm_read            = backend_re_arm_read,.submit_write           = backend_submit_write
+IOBackend iouring_backend = {
+    .name                   = "io_uring",
+    .is_async               = 1,
+    .init                   = backend_init,
+    .socket_create_listener = backend_socket_create_listener,
+    .socket_accept          = backend_socket_accept,
+    .socket_close           = backend_socket_close,
+    .socket_make_nonblocking= backend_make_nonblocking,
+    .watch_add              = backend_watch_add,
+    .watch_mod              = backend_watch_mod,
+    .watch_del              = backend_watch_del,
+    .poll                   = backend_poll,
+    .read                   = backend_read,
+    .write                  = backend_write,
+    .get_read_buffer        = backend_get_read_buffer,.re_arm_read            = backend_re_arm_read,.submit_write           = backend_submit_write
 };
