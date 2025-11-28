@@ -20,6 +20,7 @@
 #include <netinet/in.h> 
 #include <ctype.h> 
 #include <sched.h>
+#include <time.h>
 
 #include "io_backend.h"
 #include "client.h" 
@@ -108,6 +109,11 @@ typedef struct {
 
     int      active;        /* Is this slot in use? */
     int      accepted;      /* Has the upper layer 'accept()'ed this connection? */
+
+    uint32_t ts_recent;
+    int ts_present;
+
+    int client_wscale;
 } TcpSession;
 
 static TcpSession g_sessions[MAX_CLIENTS]; /* Global table of all active connections. */
@@ -117,63 +123,115 @@ static char* g_ring_buffer = NULL;/* Pointer to the mmap'd shared memory region.
 static struct     iovec *g_ring_rd = NULL; /* Helper array to track where frames are in the ring. */
 static int        g_ring_offset = 0; /* Current position in the ring buffer. */
 static uint32_t   g_packet_count = 0; /* Counter for IP ID generation. */
+static int        g_ifindex = 0;
 
 // Forward declarations
 static void handle_rx_packet(void *data, size_t len);
 
-/*
- * Standard Internet Checksum algorithm (RFC 1071).
- * Used for IP headers. We sum 16-bit words, carry the overflow, and flip bits.
- */
-static inline uint16_t checksum(const void *data, int len) {
-    const uint16_t *ptr = data;
-    uint32_t sum = 0;
-    while (len > 1) { sum += *ptr++; len -= 2; }
-    if (len > 0) { sum += *(const uint8_t *)ptr; }
-    while (sum >> 16) { sum = (sum & 0xFFFF) + (sum >> 16); }
-    return ~sum;
+static uint32_t create_isn(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // Mix seconds and nanoseconds to create a rapidly changing 32-bit number
+    return (uint32_t)(ts.tv_sec ^ ts.tv_nsec); 
 }
 
-/*
- * TCP Checksum.
- * Unlike IP, TCP requires a "Pseudo Header" (SrcIP, DstIP, Protocol, Length)
- * to be included in the checksum calculation to verify packet integrity relative to IP.
+/* * CORE CHECKSUM MATH
+ * Sums 16-bit words from a buffer. Handles odd lengths by padding with zero.
+ * Returns the raw 32-bit accumulated sum (no inversion).
  */
-static inline uint16_t tcp_checksum(struct iphdr *iph, struct tcphdr *tcph, int len) {
+static inline uint32_t raw_checksum_sum(const void *data, int len) {
+    const char *ptr = (const char *)data;
     uint32_t sum = 0;
     
-    // Source Address (4 bytes)
-    sum += (iph->saddr >> 16) & 0xFFFF;
-    sum += iph->saddr & 0xFFFF;
-    // Destination Address (4 bytes)
-    sum += (iph->daddr >> 16) & 0xFFFF;
-    sum += iph->daddr & 0xFFFF;
-    // Protocol (1 byte) + TCP Length (2 bytes) = 3 bytes, padded to 4.
-    sum += htons(IPPROTO_TCP);
-    sum += htons(len);
-
-    // 2. Sum the entire TCP segment (TCP header + options + data)
-    const uint16_t *ptr = (const uint16_t *)tcph;
-    int remaining_len = len;
-
-    while (remaining_len > 1) { 
-        sum += *ptr++; 
-        remaining_len -= 2; 
+    while (len > 1) {
+        uint16_t val;
+        memcpy(&val, ptr, 2); 
+        sum += val;
+        ptr += 2;
+        len -= 2;
     }
-    // Handle the final odd byte if present
-    if (remaining_len > 0) { 
-        sum += *(const uint8_t *)ptr; 
+    
+    if (len > 0) {
+        sum += *(const uint8_t *)ptr;
     }
+    
+    return sum;
+}
 
-    // Fold the 32-bit sum down to 16 bits
+/* * IP Checksum Wrapper 
+ * folds the sum and inverts it.
+ */
+static inline uint16_t ip_checksum(const void *data, int len) {
+    uint32_t sum = raw_checksum_sum(data, len);
+    
     while (sum >> 16) { 
         sum = (sum & 0xFFFF) + (sum >> 16); 
     }
-    
-    // Return the one's complement
-    return (uint16_t)~sum;
+    return ~sum;
 }
 
+/* * TCP Checksum Wrapper
+ * Manually constructs the Pseudo-Header in a buffer to guarantee byte order.
+ */
+static inline uint16_t tcp_checksum(struct iphdr *iph, struct tcphdr *tcph, int len) {
+    uint32_t sum = 0;
+
+    /* 1. Pseudo-Header (Constructed explicitly on stack) */
+    struct {
+        uint32_t src_ip;
+        uint32_t dst_ip;
+        uint8_t  zero;
+        uint8_t  proto;
+        uint16_t length;
+    } __attribute__((packed)) pseudo;
+
+    pseudo.src_ip = iph->saddr;
+    pseudo.dst_ip = iph->daddr;
+    pseudo.zero   = 0;
+    pseudo.proto  = IPPROTO_TCP;
+    pseudo.length = htons(len);
+
+    /* Sum Pseudo-Header */
+    sum += raw_checksum_sum(&pseudo, sizeof(pseudo));
+
+    /* 2. Sum TCP Segment (Header + Options + Payload) */
+    sum += raw_checksum_sum(tcph, len);
+
+    /* 3. Fold to 16 bits */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    return ~sum;
+}
+
+/* * SELF-VERIFICATION TOOL
+ * Call this before sendto(). It calculates what the checksum SHOULD be 
+ * and compares it to what is in the packet.
+ */
+static void verify_packet_integrity(struct iphdr *iph, struct tcphdr *tcph, int tcp_len) {
+    // Verify IP
+    uint16_t old_ip_check = iph->check;
+    iph->check = 0; // Zero out to calculate
+    uint16_t calc_ip = ip_checksum(iph, sizeof(struct iphdr));
+    iph->check = old_ip_check; // Restore
+
+    if (calc_ip != old_ip_check) {
+        fprintf(stderr, "[CRITICAL FAIL] IP Checksum Mismatch! Calc: %04x, Pkt: %04x\n", calc_ip, old_ip_check);
+    }
+
+    // Verify TCP
+    uint16_t old_tcp_check = tcph->check;
+    tcph->check = 0; // Zero out to calculate
+    uint16_t calc_tcp = tcp_checksum(iph, tcph, tcp_len);
+    tcph->check = old_tcp_check; // Restore
+
+    if (calc_tcp != old_tcp_check) {
+        fprintf(stderr, "[CRITICAL FAIL] TCP Checksum Mismatch! Calc: %04x, Pkt: %04x\n", calc_tcp, old_tcp_check);
+    } else {
+        fprintf(stderr, "[DEBUG] Checksums Verified OK.\n");
+    }
+}
 /*
  * The Core I-O function, checks the ring buffer for packets marked USER
   processes in batches, uses pre-fetching to maximise throughput. 
@@ -227,44 +285,81 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
     char frame[4096];
     memset(frame, 0, sizeof(frame));
 
-    /* Map structs over the buffer to write headers easily. */
-    struct iphdr  *iph = (struct iphdr *)frame;
+    /* 1. Map structs: ETHERNET -> IP -> TCP -> Options -> Data */
+    //struct ethhdr *eth = (struct ethhdr *)frame;
+    // struct iphdr  *iph = (struct iphdr *)(frame + sizeof(struct ethhdr));
+    // struct tcphdr *tcph = (struct tcphdr *)(frame + sizeof(struct ethhdr) + sizeof(struct iphdr));
+    // uint8_t *opt = (uint8_t *)(frame + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
+
+    struct iphdr  *iph = (struct iphdr *)frame; // Now starts at the beginning
     struct tcphdr *tcph = (struct tcphdr *)(frame + sizeof(struct iphdr));
     uint8_t *opt = (uint8_t *)(frame + sizeof(struct iphdr) + sizeof(struct tcphdr));
     
     int opt_len = 0;
-    /* If SYN flag is set, we MUST send MSS option to tell client we support 1460 bytes. */
     if (flags & XDP_TCP_SYN) {
-        opt[0] = 2; opt[1] = 4; opt[2] = (1460 >> 8) & 0xFF; opt[3] = 1460 & 0xFF;
-        opt_len = 4;
+        opt[opt_len++] = 2; // Kind: MSS
+        opt[opt_len++] = 4; // Len
+        opt[opt_len++] = (1460 >> 8) & 0xFF; 
+        opt[opt_len++] = 1460 & 0xFF;
+    }
+
+    if (s->client_wscale > 0) { 
+        opt[opt_len++] = 1; // <--- NEW NOP HERE (Aligns this block to 4 bytes)   
+        opt[opt_len++] = 3; // Kind: Window Scale
+        opt[opt_len++] = 3; // Len
+        opt[opt_len++] = 0; // Scale factor: 0
+    }
+
+    if (s->ts_present) {
+        opt[opt_len++] = 1; // NOP
+        opt[opt_len++] = 1; // NOP
+        
+        opt[opt_len++] = 8;  // Kind: Timestamp
+        opt[opt_len++] = 10; // Len
+        
+        // PAWS Fix: echo + 100
+        uint32_t my_time = htonl(s->ts_recent + 100);
+        memcpy(opt + opt_len, &my_time, 4);
+        opt_len += 4;
+        
+        // Echo
+        uint32_t echo_time = htonl(s->ts_recent);
+        memcpy(opt + opt_len, &echo_time, 4);
+        opt_len += 4;
     }
 
     char *data = (char*)(opt + opt_len);
 
-    /* Fill IP Header */
+    /* 2. Fill ETHERNET Header (Layer 2) */
+    /* On Loopback, MACs are ignored or 00s, but we must fill the struct. */
+    // memcpy(eth->h_dest, s->client_mac, ETH_ALEN); // Send back to who sent to us
+    // memset(eth->h_source, 0, ETH_ALEN);           // Source is us (lo is 00:00...)
+    // eth->h_proto = htons(ETH_P_IP);               // Protocol is IP (0x0800)
+
+    /* 3. Fill IP Header */
     iph->ihl = 5;
     iph->version = 4;
     iph->tos = 0;
+    // Total len includes IP header, TCP header, Options, and Payload (NOT Ethernet header)
     iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len);
-    iph->id = htons(g_packet_count++); /* Increment ID to avoid fragment confusion */
+    iph->id = htons(g_packet_count++);
     iph->frag_off = 0;
-    iph->ttl = 64; /* Standard TTL */
+    iph->ttl = 64;
     iph->protocol = IPPROTO_TCP;
-    iph->saddr = s->src_ip; /* Note: src_ip here is OUR ip (from session perspective) */
+    iph->saddr = s->src_ip; 
     iph->daddr = s->dst_ip; 
     iph->check = 0;
-    iph->check = checksum(iph, sizeof(struct iphdr)); /* Calculate IP Checksum */
+    iph->check = ip_checksum(iph, sizeof(struct iphdr));
 
-    /* Fill TCP Header */
+    /* 4. Fill TCP Header */
     tcph->source = s->src_port;
     tcph->dest   = s->dst_port;
     
     uint32_t seq_before = s->seq_num;
     tcph->seq    = htonl(seq_before);
     tcph->ack_seq = htonl(s->ack_num);
-    tcph->doff   = (sizeof(struct tcphdr) + opt_len) / 4; /* Data offset in 32-bit words */
+    tcph->doff   = (sizeof(struct tcphdr) + opt_len) / 4;
     
-    /* Set specific Flags based on arguments */
     if (flags & XDP_TCP_FIN) tcph->fin = 1;
     if (flags & XDP_TCP_SYN) tcph->syn = 1;
     if (flags & XDP_TCP_RST) tcph->rst = 1;
@@ -272,43 +367,48 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
     if (flags & XDP_TCP_ACK) tcph->ack = 1;
     if (flags & XDP_TCP_URG) tcph->urg = 1;
 
-    tcph->window = htons(64000); /* Advertise a large receive window */
+    tcph->window = htons(64000);
     tcph->check  = 0; 
     tcph->urg_ptr = 0;
 
     if (len > 0) {
         memcpy(data, payload, len);
     }
+    int tcp_segment_len = sizeof(struct tcphdr) + opt_len + len;
 
-    /* Calculate TCP Checksum (covers pseudo header + TCP header + data) */
-    tcph->check = tcp_checksum(iph, tcph, sizeof(struct tcphdr) + opt_len + len);
+    /* TCP Checksum covers Pseudo-Header + TCP + Options + Data */
+    tcph->check = 0;
+    tcph->check = tcp_checksum(iph, tcph, tcp_segment_len);
 
-    struct sockaddr_in sin;
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = s->dst_ip; 
-    
+    verify_packet_integrity(iph, tcph, tcp_segment_len);
+
+    /* 5. Prepare SockAddr_LL (Link Layer Address) */
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = g_ifindex; // Must match the loopback interface index
+    sll.sll_halen = ETH_ALEN;
+    sll.sll_protocol = htons(ETH_P_IP);
+    memcpy(sll.sll_addr, s->client_mac, ETH_ALEN); 
+
+    /* 6. Send raw frame */
+    //size_t total_frame_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len;
+    size_t total_frame_len = sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len;
+
+
     ssize_t sent = -1;
-    
-    // INFINITE RETRY WITH RX DRAIN
-    // We cannot drop packets in this stack or connection dies.
-    /* * Since we don't have a retransmission queue (simplified stack), 
-     * we CANNOT fail to send this packet. We must loop until successful.
-     * This should be improved for better throughput
-     */
     int retries = 0;
+    
     while (1) { 
-        sent = sendto(g_send_fd, frame, sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len, 
-                      0, (struct sockaddr*)&sin, sizeof(sin));
+        /* Note: We send 'total_frame_len' which includes ethhdr */
+        sent = sendto(g_send_fd, frame, total_frame_len, 
+                      0, (struct sockaddr*)&sll, sizeof(sll));
         
         if (sent >= 0) break;
         
-        /* If outgoing buffer is full (ENOBUFS/EAGAIN), we yield and process RX to help clear system pressure. */
         if (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            // Congestion! Process RX to help clear buffers.
             drain_rx_queue_internal();
             if (retries < 1000) {
-                /* Busy wait to avoid calling sched yield */
                 retries++;
             } else {
                 struct pollfd pfd = { .fd = g_send_fd, .events = POLLOUT };
@@ -318,14 +418,11 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
             continue;
         }
         
-        // Fatal error (Network Down) - Break to avoid infinite freeze, but connection is likely dead
-        perror("sendto fatal");
+        perror("sendto (AF_PACKET) fatal");
         break; 
     }
     
     if (sent >= 0) {
-        //DLOG("TX FD:%d Seq:%u Ack:%u Flags:%02X\n", s->id, seq_before, s->ack_num, flags);
-        /* Advance Sequence number: SYN and FIN consume 1 logical sequence number, Data consumes length. */
         if (len > 0) s->seq_num += len;
         else if (flags & (XDP_TCP_SYN | XDP_TCP_FIN)) s->seq_num++;
     }
@@ -358,7 +455,7 @@ static TcpSession* create_session(uint32_t saddr, uint16_t sport, uint32_t daddr
             g_sessions[i].dst_port = sport; 
             g_sessions[i].src_port = dport; 
             memcpy(g_sessions[i].client_mac, mac, ETH_ALEN);
-            g_sessions[i].seq_num = 1000;   /* Initial Sequence Number (ISN) */
+            g_sessions[i].seq_num = create_isn();
             g_sessions[i].rx_head = 0;
             g_sessions[i].rx_tail = 0;
             
@@ -375,130 +472,149 @@ static TcpSession* create_session(uint32_t saddr, uint16_t sport, uint32_t daddr
  * and decides how to update state and what to send back.
  */
 static void handle_rx_packet(void *data, size_t len) {
-    /* Basic length validation to avoid segfaults reading headers. */
     if (len < sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr)) return;
 
     struct ethhdr *eth = (struct ethhdr *)data;
-    if (ntohs(eth->h_proto) != ETH_P_IP) return; /* Only handle IPv4 */
+    if (ntohs(eth->h_proto) != ETH_P_IP) return;
 
     struct iphdr *iph = (struct iphdr *)(data + sizeof(struct ethhdr));
-    if (iph->protocol != IPPROTO_TCP) return; /* Only handle TCP */
+    if (iph->protocol != IPPROTO_TCP) return;
 
     struct tcphdr *tcph = (struct tcphdr *)(data + sizeof(struct ethhdr) + sizeof(struct iphdr));
     
-    /* Ignore packets sent BY us (Loopback reflection). */
     if (ntohs(tcph->source) == LISTEN_PORT) return;
-    /* Ignore packets not destined FOR us. */
     if (ntohs(tcph->dest) != LISTEN_PORT) return;
 
     TcpSession *sess = get_session(iph->saddr, tcph->source);
 
     uint32_t seq = ntohl(tcph->seq);
     uint32_t ack_seq = ntohl(tcph->ack_seq);
-    /* Calculate actual payload length: Total IP len - IP Header - TCP Header. */
     uint32_t seg_len = ntohs(iph->tot_len) - (iph->ihl*4) - (tcph->doff*4);
 
+    // --- LOGIC MOVED/DUPLICATED HERE FOR NEW SESSIONS ---
+    
     // SYN HANDLING
     if (tcph->syn && !tcph->ack) { 
         if (!sess) {
-            /* Create new session structure. */
             sess = create_session(iph->saddr, tcph->source, iph->daddr, tcph->dest, eth->h_source);
-            if (sess) {
-                sess->ack_num = seq + 1; /* ACK the SYN */
-                sess->seq_num = 1000;    /* Set our ISN */
-                sess->state = TCP_SYN_RCVD;
-                /* Send SYN+ACK to complete step 2 of handshake. */
-                send_raw_packet(NULL, 0, sess, XDP_TCP_SYN | XDP_TCP_ACK);
-            }
         } else {
-            // Reuse/Retry Logic
-            /* If we get a SYN for an existing session, it's a retry or a fast reuse. Reset. */
-            //DLOG("SYN Retry/Reuse FD:%d\n", sess->id);
+            // Reuse existing
             sess->ack_num = seq + 1;
-            // Don't reset seq_num if retrying, but reset if reusing (hard to tell)
-            // Simple logic: If SYN received, assume Client wants to start over.
-            sess->seq_num = 1000; 
+            sess->seq_num = create_isn();
             sess->state = TCP_SYN_RCVD;
-            sess->rx_head = sess->rx_tail = 0; // Clear buffer
+            sess->rx_head = sess->rx_tail = 0; 
+        }
+
+        if (sess) {
+            /* [FIX] PARSE OPTIONS NOW, so the new session captures the TS */
+            sess->ts_present = 0;
+            sess->client_wscale = 0; // Reset this for safety
+            uint8_t *opt_ptr = (uint8_t *)tcph + 20; 
+            int opt_remaining = (tcph->doff * 4) - 20;
+
+            while (opt_remaining > 0) {
+                uint8_t kind = opt_ptr[0];
+                if (kind == 0) break;
+                if (kind == 1) { opt_ptr++; opt_remaining--; continue; }
+
+                uint8_t len = opt_ptr[1];
+                if (len > opt_remaining || len < 2) break;
+
+                if (kind == 8 && len == 10) { 
+                    uint32_t ts_val;
+                    memcpy(&ts_val, opt_ptr + 2, 4);
+                    sess->ts_recent = ntohl(ts_val); 
+                    sess->ts_present = 1;
+                }
+
+                if (kind == 3 && len == 3) { // Window Scale Option
+                    sess->client_wscale = opt_ptr[2];
+                }
+                opt_ptr += len;
+                opt_remaining -= len;
+            }
+
+            // NOW send the SYN-ACK (which will now correctly include the TS echo)
+            sess->ack_num = seq + 1; 
+            sess->state = TCP_SYN_RCVD;
             send_raw_packet(NULL, 0, sess, XDP_TCP_SYN | XDP_TCP_ACK);
         }
         return;
     }
 
-    /* If no session exists and it wasn't a SYN, we can't do anything. Drop it. */
     if (!sess) return;
+
+    /* [FIX] FOR ESTABLISHED SESSIONS, PARSE OPTIONS HERE TO UPDATE TS */
+    // We also need to update TS on data packets to keep PAWS happy
+    if (1) {
+        uint8_t *opt_ptr = (uint8_t *)tcph + 20; 
+        int opt_remaining = (tcph->doff * 4) - 20;
+
+        while (opt_remaining > 0) {
+            uint8_t kind = opt_ptr[0];
+            if (kind == 0) break; 
+            if (kind == 1) { opt_ptr++; opt_remaining--; continue; } 
+
+            uint8_t len = opt_ptr[1];
+            if (len > opt_remaining || len < 2) break; 
+
+            if (kind == 8 && len == 10) { 
+                uint32_t ts_val;
+                memcpy(&ts_val, opt_ptr + 2, 4);
+                sess->ts_recent = ntohl(ts_val); // Update timestamp!
+                sess->ts_present = 1;
+            }
+
+            if (kind == 3 && len == 3) { // Window Scale Option
+                sess->client_wscale = opt_ptr[2];
+            }
+            opt_ptr += len;
+            opt_remaining -= len;
+        }
+    }
 
     uint32_t header_len = sizeof(struct ethhdr) + (iph->ihl*4) + (tcph->doff*4);
     if (len < header_len) return;
     
     // ACK HANDLING
     if (tcph->ack) {
-        // We don't maintain a retransmit queue, so we just assume ACK is good.
-        // Only thing: Check if handshake is done.
-        /* If we were waiting for the final ACK of the handshake, transition to ESTABLISHED. */
         if (sess->state == TCP_SYN_RCVD && !tcph->syn) {
             if (ack_seq == 1001) {
                 sess->state = TCP_ESTABLISHED;
-                //DLOG("FD:%d ESTABLISHED\n", sess->id);
             }
         }
     }
 
     // DATA Handling
     if (seg_len > 0) {
-        // If duplicate data or retransmit?
-        /* Strictly check SEQ to ensure in-order delivery. */
         if (seq == sess->ack_num) { 
-            uint32_t header_len = sizeof(struct ethhdr) + (iph->ihl*4) + (tcph->doff*4);
             char *payload = (char*)data + header_len;
-            
-            // CALCULATE SPACE
             size_t data_in_buffer = sess->rx_tail - sess->rx_head;
             size_t space = SESSION_BUF_SIZE - data_in_buffer;
             
             if (seg_len <= space) {
-                //  CALCULATE PHYSICAL WRITE POSITION
                 size_t write_pos = sess->rx_tail % SESSION_BUF_SIZE;
-                
-                /* Check if data wraps around the end of the physical buffer */
                 size_t till_end = SESSION_BUF_SIZE - write_pos;
                 
                 if (seg_len <= till_end) {
-                    // Single contiguous write
                     memcpy(sess->rx_buf + write_pos, payload, seg_len);
                 } else {
-                    // wraps around the circular buffer, write around both sides
                     memcpy(sess->rx_buf + write_pos, payload, till_end);
                     memcpy(sess->rx_buf, payload + till_end, seg_len - till_end);
                 }
-                
-                // ADVANCE ABSOLUTE TAIL POINTER
                 sess->rx_tail += seg_len; 
-                sess->ack_num = seq + seg_len; /* Update what we expect next */
-
-            } else {
-                // Buffer Full
+                sess->ack_num = seq + seg_len; 
             }
         }
-        // Always ACK (Cumulative ACK)
-        /* Send ACK immediately to keep window open. */
-        // send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
-
-        // Changed this ^ to a delayed ACK, rather than sending an ACK
-        // on connection , we can send it alongside once we process the data from the connection.
-        // This somehow nearly doubled the throughput... strange
     }
     
     // FIN HANDLING
     if (tcph->fin) {
-        if (seq == sess->ack_num) { // Only accept FIN if in order
-            //DLOG("FD:%d RX FIN\n", sess->id);
-            sess->ack_num++; /* FIN consumes one sequence number */
-            /* Send ACK+FIN. We are doing a fast close (Active Close + Passive Close combined). */
+        if (seq == sess->ack_num) {
+            sess->ack_num++; 
             send_raw_packet(NULL, 0, sess, XDP_TCP_ACK | XDP_TCP_FIN);
-            sess->state = TCP_CLOSE_WAIT; // App needs to read 0 to close, maintain consistency with the app
+            sess->state = TCP_CLOSE_WAIT; 
         } else {
-            // Out of order FIN? ACK where we are.
             send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
         }
     }
@@ -510,17 +626,14 @@ static int backend_init(void) {
     g_raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (g_raw_fd < 0) { perror("socket AF_PACKET RX"); return -1; }
 
-    /*  Create AF_INET RAW socket for TX. This allows injecting IP packets. */
-    g_send_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (g_send_fd < 0) { perror("socket RAW TX"); return -1; }
+/* 2. TX Socket (CHANGED from AF_INET to AF_PACKET) */
+    /* We use SOCK_RAW so we can write the Ethernet header ourselves. */
+    g_send_fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+    if (g_send_fd < 0) { perror("socket AF_PACKET TX"); return -1; }
     
     /* Set non-blocking to prevent freezes. */
     int flags = fcntl(g_send_fd, F_GETFL, 0);
     fcntl(g_send_fd, F_SETFL, flags | O_NONBLOCK);
-
-    /* IP_HDRINCL tells the kernel "I have already built the IP header, don't add one". */
-    int one = 1;
-    setsockopt(g_send_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
 
     // HUGE BUFFERS
     /* Increase socket buffers to maximum to prevent packet drops during bursts. */
@@ -529,13 +642,13 @@ static int backend_init(void) {
     setsockopt(g_raw_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
 
     /* Get Interface Index for Loopback ('lo'). */
-    int ifindex = if_nametoindex("lo");
-    if (ifindex == 0) { perror("if_nametoindex lo"); return -1; }
+    g_ifindex = if_nametoindex("lo");
+    if (g_ifindex == 0) { perror("if_nametoindex lo"); return -1; }
 
     /* Enter Promiscuous mode to see all traffic on the interface. */
     struct packet_mreq mreq;
     memset(&mreq, 0, sizeof(mreq));
-    mreq.mr_ifindex = ifindex;
+    mreq.mr_ifindex = g_ifindex;
     mreq.mr_type = PACKET_MR_PROMISC;
     setsockopt(g_raw_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
@@ -569,7 +682,7 @@ static int backend_init(void) {
     memset(&sll, 0, sizeof(sll));
     sll.sll_family = AF_PACKET;
     sll.sll_protocol = htons(ETH_P_ALL);
-    sll.sll_ifindex = ifindex;
+    sll.sll_ifindex = g_ifindex;
 
     if (bind(g_raw_fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
         perror("bind raw"); return -1;
