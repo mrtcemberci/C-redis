@@ -12,14 +12,18 @@
 #define NUM_THREADS 4
 #define DURATION_SEC 5 
 #define SERVER_PORT 6379
-#define SERVER_IP "127.0.0.1"
 #define MAX_SAMPLES 2000000
 
-// Thread structure to hold results
+// Thread structure to hold results AND config
 typedef struct {
+    // Stats
     long long requests_completed;
     int thread_id;
     long long* latencies;
+    
+    // Config
+    int use_veth;           // Flag: 1 if using veth, 0 otherwise
+    const char* server_ip;  // IP to connect to
 } thread_stats_t;
 
 // The worker function each thread runs
@@ -34,14 +38,37 @@ void *benchmark_worker(void *arg) {
     }
     
     int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Socket creation failed");
+        free(stats->latencies);
+        return NULL;
+    }
+
+    // CONDITIONAL BINDING: Only bind to 10.0.0.2 if in veth mode
+    if (stats->use_veth) {
+        struct sockaddr_in client_addr;
+        client_addr.sin_family = AF_INET;
+        client_addr.sin_port = 0; // Let the kernel choose an ephemeral port
+        inet_pton(AF_INET, "10.0.0.2", &client_addr.sin_addr);
+
+        if (bind(sock, (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
+            perror("Thread failed to bind to 10.0.0.2");
+            free(stats->latencies);
+            close(sock);
+            return NULL;
+        }
+    }
+
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(SERVER_PORT);
-    inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr);
+    // Use the IP passed in the struct
+    inet_pton(AF_INET, stats->server_ip, &serv_addr.sin_addr);
     
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         perror("Connection failed");
         free(stats->latencies);
+        close(sock);
         return NULL;
     }
 
@@ -55,7 +82,7 @@ void *benchmark_worker(void *arg) {
     // Attack loop
     while (time(NULL) - loop_start < DURATION_SEC) {
         if (stats->requests_completed >= MAX_SAMPLES) break;
----
+
         clock_gettime(CLOCK_MONOTONIC, &start);
 
         if (send(sock, request, req_len, 0) < 0) break;
@@ -81,7 +108,19 @@ int compare_ll(const void *a, const void *b) {
     return (arg1 > arg2) - (arg1 < arg2);
 }
 
-int main() {
+int main(int argc, char **argv) {
+    // Check arguments
+    int use_veth = 0;
+    const char *target_ip = "127.0.0.1"; // Default to localhost
+
+    if (argc > 1 && strcmp(argv[1], "veth") == 0) {
+        use_veth = 1;
+        target_ip = "10.0.0.1";
+        printf("Mode: VETH (Binding to 10.0.0.2, Connecting to 10.0.0.1)\n");
+    } else {
+        printf("Mode: STANDARD (Localhost, no specific binding)\n");
+    }
+
     pthread_t threads[NUM_THREADS];
     thread_stats_t stats[NUM_THREADS];
     struct timespec benchmark_start, benchmark_end;
@@ -93,6 +132,10 @@ int main() {
     for (int i = 0; i < NUM_THREADS; i++) {
         stats[i].requests_completed = 0;
         stats[i].thread_id = i;
+        // Pass configuration to workers
+        stats[i].use_veth = use_veth;
+        stats[i].server_ip = target_ip;
+        
         pthread_create(&threads[i], NULL, benchmark_worker, &stats[i]);
     }
 
@@ -101,7 +144,7 @@ int main() {
         pthread_join(threads[i], NULL);
         total_reqs += stats[i].requests_completed;
     }
--
+
     clock_gettime(CLOCK_MONOTONIC, &benchmark_end);
 
     double elapsed_seconds = (benchmark_end.tv_sec - benchmark_start.tv_sec) + 
@@ -130,6 +173,13 @@ int main() {
 
     // Sort for percentiles
     qsort(all_latencies, total_reqs, sizeof(long long), compare_ll);
+
+    // Check if we actually have data before accessing the array
+    if (total_reqs == 0) {
+        printf("\nNo requests completed. Check server availability.\n");
+        free(all_latencies);
+        return 0; 
+    }
 
     // Calculate Metrics
     double throughput = total_reqs / elapsed_seconds;

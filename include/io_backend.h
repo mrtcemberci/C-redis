@@ -99,5 +99,6 @@ extern IOBackend* g_backend;
 extern IOBackend epoll_backend;
 extern IOBackend iouring_backend;
 extern IOBackend xdp_backend;
+extern IOBackend veth_backend;
 
 #endif

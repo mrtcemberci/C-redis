@@ -64,8 +64,10 @@ int main(int argc, char *argv[]) {
             g_backend = &epoll_backend;
         } else if (strcasecmp(argv[1], "xdp") == 0) {
             g_backend = &xdp_backend;
+        } else if (strcasecmp(argv[1], "veth") == 0) {
+            g_backend = &veth_backend;
         } else {
-            fprintf(stderr, "Usage: %s [epoll|io_uring|xdp]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [epoll|io_uring|xdp|veth]\n", argv[0]);
             return 1;
         }
     }

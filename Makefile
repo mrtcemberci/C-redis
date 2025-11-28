@@ -3,7 +3,7 @@ CFLAGS = -Wall -Wextra -Ofast -Iinclude -D_GNU_SOURCE
 LDFLAGS = -luring 
 
 SERVER_EXE = redis-clone
-SERVER_SRCS = src/server.c src/backend/backend_epoll.c src/backend/backend_iouring.c src/backend/backend_xdp.c src/client.c src/parser.c src/hashmap.c
+SERVER_SRCS = src/server.c src/backend/backend_epoll.c src/backend/backend_iouring.c src/backend/backend_xdp.c src/backend/backend_veth_xdp.c src/client.c src/parser.c src/hashmap.c
 SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 
 TEST_HASHMAP_EXE = test_hashmap
