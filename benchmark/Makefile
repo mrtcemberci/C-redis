@@ -1,19 +1,15 @@
 CC = gcc
-CFLAGS = -Wall -Werror -g
+CFLAGS = -Wall -Werror -O3
 LDFLAGS = -pthread
-TARGET = benchmark
-SRC = benchmark.c
 
-all: $(TARGET)
+all: throughput latency
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+throughput: throughput.c
+	$(CC) $(CFLAGS) throughput.c -o throughput $(LDFLAGS)
+
+latency: latency.c
+	$(CC) $(CFLAGS) latency.c -o latency $(LDFLAGS)
 
 .PHONY: clean
 clean:
-	rm -f $(TARGET)
-	rm -f *.o
-
-.PHONY: run
-run: $(TARGET)
-	./$(TARGET)
+	rm -f throughput latency *.o

@@ -8,4 +8,5 @@ redis-clone
 .DS_Store*~*.swp*.swo
 *.dSYM/
 .vscode
-benchmark/benchmark
+benchmark/latency
+benchmark/throughput
