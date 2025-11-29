@@ -111,8 +111,8 @@ typedef struct {
 } TcpSession;
 
 static TcpSession g_sessions[MAX_CLIENTS]; /* Global table of all active connections. */
-static int        g_raw_fd = -1;  /* The AF_PACKET socket for Receiving. */
-static int        g_send_fd = -1; /* The AF_INET Raw socket for Sending. */
+static int        g_rx_fd = -1;  /* The AF_PACKET socket for Receiving. */
+static int        g_tx_fd = -1; /* The AF_INET Raw socket for Sending. */
 static char* g_ring_buffer = NULL;/* Pointer to the mmap'd shared memory region. */
 static struct     iovec *g_ring_rd = NULL; /* Helper array to track where frames are in the ring. */
 static int        g_ring_offset = 0; /* Current position in the ring buffer. */
@@ -298,7 +298,7 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
      */
     int retries = 0;
     while (1) { 
-        sent = sendto(g_send_fd, frame, sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len, 
+        sent = sendto(g_tx_fd, frame, sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len, 
                       0, (struct sockaddr*)&sin, sizeof(sin));
         
         if (sent >= 0) break;
@@ -311,7 +311,7 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
                 /* Busy wait to avoid calling sched yield */
                 retries++;
             } else {
-                struct pollfd pfd = { .fd = g_send_fd, .events = POLLOUT };
+                struct pollfd pfd = { .fd = g_tx_fd, .events = POLLOUT };
                 poll(&pfd, 1, 1); 
                 retries = 0;
             }
@@ -507,26 +507,26 @@ static void handle_rx_packet(void *data, size_t len) {
 
 static int backend_init(void) {
     /* Create AF_PACKET socket for RX. This listens to Ethernet frames. */
-    g_raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (g_raw_fd < 0) { perror("socket AF_PACKET RX"); return -1; }
+    g_rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (g_rx_fd < 0) { perror("socket AF_PACKET RX"); return -1; }
 
     /*  Create AF_INET RAW socket for TX. This allows injecting IP packets. */
-    g_send_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (g_send_fd < 0) { perror("socket RAW TX"); return -1; }
+    g_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (g_tx_fd < 0) { perror("socket RAW TX"); return -1; }
     
     /* Set non-blocking to prevent freezes. */
-    int flags = fcntl(g_send_fd, F_GETFL, 0);
-    fcntl(g_send_fd, F_SETFL, flags | O_NONBLOCK);
+    int flags = fcntl(g_tx_fd, F_GETFL, 0);
+    fcntl(g_tx_fd, F_SETFL, flags | O_NONBLOCK);
 
     /* IP_HDRINCL tells the kernel "I have already built the IP header, don't add one". */
     int one = 1;
-    setsockopt(g_send_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    setsockopt(g_tx_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
 
     // HUGE BUFFERS
     /* Increase socket buffers to maximum to prevent packet drops during bursts. */
     int buf_size = 128 * 1024 * 1024; 
-    setsockopt(g_send_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-    setsockopt(g_raw_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+    setsockopt(g_tx_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    setsockopt(g_rx_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
 
     /* Get Interface Index for Loopback ('lo'). */
     int ifindex = if_nametoindex("lo");
@@ -537,7 +537,7 @@ static int backend_init(void) {
     memset(&mreq, 0, sizeof(mreq));
     mreq.mr_ifindex = ifindex;
     mreq.mr_type = PACKET_MR_PROMISC;
-    setsockopt(g_raw_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    setsockopt(g_rx_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
     /* Prepare for Memory Mapped RX. */
     struct tpacket_req req;
@@ -548,13 +548,13 @@ static int backend_init(void) {
     req.tp_frame_nr = FRAME_NR;
 
     /* Tell the kernel to use the Ring Buffer for RX. */
-    if (setsockopt(g_raw_fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0) {
+    if (setsockopt(g_rx_fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0) {
         perror("setsockopt PACKET_RX_RING"); return -1;
     }
 
     /* Map the ring buffer into our process memory space */
     size_t ring_size = (size_t)req.tp_block_nr * req.tp_block_size;
-    g_ring_buffer = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_raw_fd, 0);
+    g_ring_buffer = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_rx_fd, 0);
     if (g_ring_buffer == MAP_FAILED) { perror("mmap ring"); return -1; }
 
     /* Set up local IO Vector array to track frame positions easily. */
@@ -571,7 +571,7 @@ static int backend_init(void) {
     sll.sll_protocol = htons(ETH_P_ALL);
     sll.sll_ifindex = ifindex;
 
-    if (bind(g_raw_fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+    if (bind(g_rx_fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
         perror("bind raw"); return -1;
     }
     
