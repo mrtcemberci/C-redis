@@ -20,6 +20,7 @@
 #include <netinet/in.h> 
 #include <ctype.h> 
 #include <sched.h>
+#include <sys/ioctl.h>
 
 #include "io_backend.h"
 #include "client.h" 
@@ -114,6 +115,7 @@ typedef struct {
     int      accepted;      /* Has the upper layer 'accept()'ed this connection? */
 } TcpSession;
 
+static unsigned char g_src_mac[ETH_ALEN];
 static TcpSession g_sessions[MAX_CLIENTS]; /* Global table of all active connections. */
 static int        g_raw_fd = -1;  /* The AF_PACKET socket for Receiving. */
 static int        g_send_fd = -1; /* The AF_INET Raw socket for Sending. */
@@ -251,11 +253,11 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
     char frame[4096];
     memset(frame, 0, sizeof(frame));
 
-    /* 1. Map structs: IP -> TCP -> Options -> Data */
-    /* NOTE: We skip the Ethernet header here because we use SOCK_DGRAM */
-    struct iphdr  *iph = (struct iphdr *)frame; 
-    struct tcphdr *tcph = (struct tcphdr *)(frame + sizeof(struct iphdr));
-    uint8_t *opt = (uint8_t *)(frame + sizeof(struct iphdr) + sizeof(struct tcphdr));
+    struct ethhdr *eth = (struct ethhdr *)frame;
+    /* Shift IP pointer past the Ethernet header */
+    struct iphdr  *iph = (struct iphdr *)(frame + sizeof(struct ethhdr)); 
+    struct tcphdr *tcph = (struct tcphdr *)(frame + sizeof(struct ethhdr) + sizeof(struct iphdr));
+    uint8_t *opt = (uint8_t *)(frame + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
     
     int opt_len = 0;
 
@@ -305,6 +307,10 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
     }
 
     char *data = (char*)(opt + opt_len);
+
+    memcpy(eth->h_dest, s->client_mac, ETH_ALEN); // Client is Dest
+    memcpy(eth->h_source, g_src_mac, ETH_ALEN);   // We are Source
+    eth->h_proto = htons(ETH_P_IP);
 
     /* --- IP HEADER --- */
     iph->ihl = 5;
@@ -360,8 +366,7 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
     memcpy(sll.sll_addr, s->client_mac, ETH_ALEN); 
 
     /* Total length sent to sendto (IP packet size) */
-    size_t total_frame_len = sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len;
-
+    size_t total_frame_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len;
     ssize_t sent = -1;
     int retries = 0;
     
@@ -418,9 +423,10 @@ static TcpSession* create_session(uint32_t saddr, uint16_t sport, uint32_t daddr
             g_sessions[i].src_ip = daddr;   /* Swapped: Packet Dst is Session Src */
             g_sessions[i].dst_port = sport; 
             g_sessions[i].src_port = dport; 
-            unsigned char static_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x02};
-            memcpy(g_sessions[i].client_mac, static_mac, ETH_ALEN);
-            //memcpy(g_sessions[i].client_mac, mac, ETH_ALEN);
+            // This is hard-coded in VETH pair but not hardcoding is fine
+            // unsigned char static_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x02};
+            // memcpy(g_sessions[i].client_mac, static_mac, ETH_ALEN);
+            memcpy(g_sessions[i].client_mac, mac, ETH_ALEN);
             g_sessions[i].seq_num = 1000;   /* Initial Sequence Number (ISN) */
             g_sessions[i].rx_head = 0;
             g_sessions[i].rx_tail = 0;
@@ -579,17 +585,13 @@ static int backend_init(void) {
     g_raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (g_raw_fd < 0) { perror("socket AF_PACKET RX"); return -1; }
 
-    /* Create AF_INET RAW socket for TX. This allows injecting IP packets. */
-    g_send_fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+    /* Create AF_PACKET RAW socket for TX. */
+    g_send_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
     if (g_send_fd < 0) { perror("socket RAW TX"); return -1; }
     
     /* Set non-blocking to prevent freezes. */
     int flags = fcntl(g_send_fd, F_GETFL, 0);
     fcntl(g_send_fd, F_SETFL, flags | O_NONBLOCK);
-
-    /* IP_HDRINCL tells the kernel "I have already built the IP header, don't add one". */
-    // int one = 1;
-    // setsockopt(g_send_fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
 
     // HUGE BUFFERS
     /* Increase socket buffers to maximum to prevent packet drops during bursts. */
@@ -643,6 +645,16 @@ static int backend_init(void) {
     if (bind(g_raw_fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
         perror("bind raw"); return -1;
     }
+
+    /* Record our MAC address */
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "veth-host", IFNAMSIZ - 1);
+    if (ioctl(g_send_fd, SIOCGIFHWADDR, &ifr) < 0) {
+        perror("ioctl SIOCGIFHWADDR");
+        return -1;
+    }
+    memcpy(g_src_mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
     
     printf("(Network) Backend 'xdp-veth' initialized on 'veth'.\n");
     return 0;
