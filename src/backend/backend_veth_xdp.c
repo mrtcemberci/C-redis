@@ -125,6 +125,15 @@ static int        g_ring_offset = 0; /* Current position in the ring buffer. */
 static uint32_t   g_packet_count = 0; /* Counter for IP ID generation. */
 static int g_ifindex = 0;
 
+#define TX_BLOCK_SIZE      (4096)
+#define TX_BLOCK_NR        256
+#define TX_FRAME_SIZE      4096
+#define TX_FRAME_NR        (TX_BLOCK_SIZE * TX_BLOCK_NR / TX_FRAME_SIZE)
+
+static char *g_tx_ring_buffer = NULL;
+static struct iovec *g_tx_ring_vec = NULL;
+static int g_tx_ring_offset = 0;
+
 // Forward declarations
 static void handle_rx_packet(void *data, size_t len);
 
@@ -250,76 +259,66 @@ static inline void drain_rx_queue_internal(void) {
  * We manually build: IP Header -> TCP Header -> Options -> Payload.
  */
 static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uint8_t flags) {
-    char frame[4096];
-    memset(frame, 0, sizeof(frame));
+    int idx = g_tx_ring_offset;
+    volatile struct tpacket_hdr *tp = (struct tpacket_hdr *)g_tx_ring_vec[idx].iov_base;
 
-    struct ethhdr *eth = (struct ethhdr *)frame;
-    /* Shift IP pointer past the Ethernet header */
-    struct iphdr  *iph = (struct iphdr *)(frame + sizeof(struct ethhdr)); 
-    struct tcphdr *tcph = (struct tcphdr *)(frame + sizeof(struct ethhdr) + sizeof(struct iphdr));
-    uint8_t *opt = (uint8_t *)(frame + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
+    /* Spin-Wait for Ring Slot */
+    int retries = 0;
+    while (tp->tp_status != TP_STATUS_AVAILABLE && tp->tp_status != TP_STATUS_WRONG_FORMAT) {
+        sendto(g_send_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+        /* You can add a poll here but I dont want to context-switch. I would rather 
+        burn CPU-cycles for low latency. */
+        if (++retries > 10000000) { 
+            fprintf(stderr, "[FATAL] TX Ring Stuck! Interface down?\n");
+            return; 
+        }
+    }
+
+    /* Align the data start */
+    uint8_t *frame_base = (uint8_t *)tp;
+    uint8_t *data = frame_base + TPACKET_HDRLEN - sizeof(struct sockaddr_ll);
+    
+    /* Set up pointers */
+    struct ethhdr *eth = (struct ethhdr *)data;
+    struct iphdr  *iph = (struct iphdr *)(data + sizeof(struct ethhdr));
+    struct tcphdr *tcph = (struct tcphdr *)(data + sizeof(struct ethhdr) + sizeof(struct iphdr));
+    uint8_t *opt = (uint8_t *)(data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
     
     int opt_len = 0;
 
-    /* --- OPTION BUILDING --- */
-    
-    /* 1. MSS Option (Only on SYN) */
     if (flags & XDP_TCP_SYN) {
-        opt[opt_len++] = 2; // Kind: MSS
-        opt[opt_len++] = 4; // Len
-        opt[opt_len++] = (1460 >> 8) & 0xFF; 
-        opt[opt_len++] = 1460 & 0xFF;
+        opt[opt_len++] = 2; opt[opt_len++] = 4; 
+        opt[opt_len++] = (1460 >> 8) & 0xFF; opt[opt_len++] = 1460 & 0xFF;
     }
-
-    /* 2. Window Scale Option (Only on SYN) */
     if (s->client_wscale > 0 && (flags & XDP_TCP_SYN)) { 
-        opt[opt_len++] = 1; // NOP (Aligns this block to 4 bytes)   
-        opt[opt_len++] = 3; // Kind: Window Scale
-        opt[opt_len++] = 3; // Len
-        opt[opt_len++] = 0; // Scale factor: 0 (We accept scaling but don't use it)
+        opt[opt_len++] = 1; opt[opt_len++] = 3; opt[opt_len++] = 3; opt[opt_len++] = 0; 
     }
-
-    /* 3. Timestamp Option (On SYN or if negotiated) */
     if (s->ts_present) {
-        // Add NOPs to align to 4-byte boundary if needed
-        while ((opt_len % 4) != 0) {
-            opt[opt_len++] = 1; // NOP
-        }
-        
-        opt[opt_len++] = 8;  // Kind: Timestamp
-        opt[opt_len++] = 10; // Len
-        
-        // TSval: My time (echo + 100)
+        while ((opt_len % 4) != 0) opt[opt_len++] = 1; 
+        opt[opt_len++] = 8; opt[opt_len++] = 10;
         uint32_t my_time = htonl(s->ts_recent + 100);
-        memcpy(opt + opt_len, &my_time, 4);
-        opt_len += 4;
-        
-        // TSecr: Echo their time
+        memcpy(opt + opt_len, &my_time, 4); opt_len += 4;
         uint32_t echo_time = htonl(s->ts_recent);
-        memcpy(opt + opt_len, &echo_time, 4);
-        opt_len += 4;
+        memcpy(opt + opt_len, &echo_time, 4); opt_len += 4;
+    }
+    while ((opt_len % 4) != 0) opt[opt_len++] = 1; 
+
+    /* Payload Copy */
+    char *payload_dest = (char*)(opt + opt_len);
+    if (len > 0) {
+        memcpy(payload_dest, payload, len);
     }
 
-    /* 4. Final Padding for Alignment */
-    /* Ensure the TCP header size is a multiple of 4 bytes */
-    while ((opt_len % 4) != 0) {
-        opt[opt_len++] = 1; // NOP
-    }
-
-    char *data = (char*)(opt + opt_len);
-
-    memcpy(eth->h_dest, s->client_mac, ETH_ALEN); // Client is Dest
-    memcpy(eth->h_source, g_src_mac, ETH_ALEN);   // We are Source
+    memcpy(eth->h_dest, s->client_mac, ETH_ALEN);
+    memcpy(eth->h_source, g_src_mac, ETH_ALEN);
     eth->h_proto = htons(ETH_P_IP);
 
-    /* --- IP HEADER --- */
     iph->ihl = 5;
     iph->version = 4;
     iph->tos = 0;
-    /* Total Len = IP Header + TCP Header + Options + Data */
     iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len);
     iph->id = htons(g_packet_count++);
-    iph->frag_off = 0; // Or htons(0x4000) for DF
+    iph->frag_off = 0;
     iph->ttl = 64;
     iph->protocol = IPPROTO_TCP;
     iph->saddr = s->src_ip; 
@@ -327,76 +326,45 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
     iph->check = 0;
     iph->check = checksum(iph, sizeof(struct iphdr));
 
-    /* --- TCP HEADER --- */
     tcph->source = s->src_port;
     tcph->dest   = s->dst_port;
-    
     tcph->seq    = htonl(s->seq_num);
     tcph->ack_seq = htonl(s->ack_num);
-    /* Data Offset: Size of TCP Header + Options in 32-bit words */
     tcph->doff   = (sizeof(struct tcphdr) + opt_len) / 4;
     
-    if (flags & XDP_TCP_FIN) tcph->fin = 1;
-    if (flags & XDP_TCP_SYN) tcph->syn = 1;
-    if (flags & XDP_TCP_RST) tcph->rst = 1;
-    if (flags & XDP_TCP_PSH) tcph->psh = 1;
-    if (flags & XDP_TCP_ACK) tcph->ack = 1;
-    if (flags & XDP_TCP_URG) tcph->urg = 1;
+    tcph->fin = (flags & XDP_TCP_FIN) ? 1 : 0;
+    tcph->syn = (flags & XDP_TCP_SYN) ? 1 : 0;
+    tcph->rst = (flags & XDP_TCP_RST) ? 1 : 0;
+    tcph->psh = (flags & XDP_TCP_PSH) ? 1 : 0;
+    tcph->ack = (flags & XDP_TCP_ACK) ? 1 : 0;
+    tcph->urg = (flags & XDP_TCP_URG) ? 1 : 0;
 
     tcph->window = htons(64000);
     tcph->check  = 0; 
     tcph->urg_ptr = 0;
 
-    /* Copy Payload Data */
-    if (len > 0) {
-        memcpy(data, payload, len);
-    }
-    
-    /* --- TCP CHECKSUM --- */
     int tcp_segment_len = sizeof(struct tcphdr) + opt_len + len;
     tcph->check = tcp_checksum(iph, tcph, tcp_segment_len);
 
-    /* --- SENDING --- */
-    struct sockaddr_ll sll;
-    memset(&sll, 0, sizeof(sll));
-    sll.sll_family = AF_PACKET;
-    sll.sll_ifindex = g_ifindex;
-    sll.sll_halen = ETH_ALEN;
-    sll.sll_protocol = htons(ETH_P_IP);
-    memcpy(sll.sll_addr, s->client_mac, ETH_ALEN); 
+    size_t total_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len;
 
-    /* Total length sent to sendto (IP packet size) */
-    size_t total_frame_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + opt_len + len;
-    ssize_t sent = -1;
-    int retries = 0;
+    tp->tp_len = total_len;
+    tp->tp_snaplen = total_len;
+    tp->tp_status = TP_STATUS_SEND_REQUEST;
     
-    while (1) { 
-        sent = sendto(g_send_fd, frame, total_frame_len, 
-                      0, (struct sockaddr*)&sll, sizeof(sll));
-        
-        if (sent >= 0) break;
-        
-        if (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            drain_rx_queue_internal();
-            if (retries < 1000) {
-                retries++;
-            } else {
-                struct pollfd pfd = { .fd = g_send_fd, .events = POLLOUT };
-                poll(&pfd, 1, 1); 
-                retries = 0;
-            }
-            continue;
-        }
-        
-        perror("sendto (AF_PACKET) fatal");
-        break; 
+    ssize_t sent = sendto(g_send_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    if (sent < 0 && errno == ENOBUFS) {
+        /* Congestion handling: do nothing, loop or poll will handle it, it is in the ring now anyway */
     }
-    
-    if (sent >= 0) {
-        if (len > 0) s->seq_num += len;
-        else if (flags & (XDP_TCP_SYN | XDP_TCP_FIN)) s->seq_num++;
-    }
+
+    /* Advance Ring */
+    g_tx_ring_offset = (g_tx_ring_offset + 1) % TX_FRAME_NR;
+
+    /* Update Sequence */
+    if (len > 0) s->seq_num += len;
+    else if (flags & (XDP_TCP_SYN | XDP_TCP_FIN)) s->seq_num++;
 }
+
 /* Helper to find an existing session by Source IP/Port */
 static TcpSession* get_session(uint32_t saddr, uint16_t sport) {
     for (int i=0; i<MAX_CLIENTS; i++) {
@@ -581,82 +549,103 @@ static void handle_rx_packet(void *data, size_t len) {
 }
 
 static int backend_init(void) {
-    /* Create AF_PACKET socket for RX. This listens to Ethernet frames. */
+    /* 1. SETUP RX SOCKET (g_raw_fd) - Uses PACKET_RX_RING */
     g_raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (g_raw_fd < 0) { perror("socket AF_PACKET RX"); return -1; }
+    if (g_raw_fd < 0) { perror("socket RX"); return -1; }
 
-    /* Create AF_PACKET RAW socket for TX. */
-    g_send_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-    if (g_send_fd < 0) { perror("socket RAW TX"); return -1; }
-    
-    /* Set non-blocking to prevent freezes. */
-    int flags = fcntl(g_send_fd, F_GETFL, 0);
-    fcntl(g_send_fd, F_SETFL, flags | O_NONBLOCK);
-
-    // HUGE BUFFERS
-    /* Increase socket buffers to maximum to prevent packet drops during bursts. */
-    int buf_size = 128 * 1024 * 1024; 
-    setsockopt(g_send_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-    setsockopt(g_raw_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-
-    /* Get Interface Index for Loopback ('lo'). */
+    /* Get Interface Index */
     g_ifindex = if_nametoindex("veth-host");
-    if (g_ifindex == 0) { perror("if_nametoindex veth-host"); return -1; }
+    if (g_ifindex == 0) { perror("if_nametoindex"); return -1; }
 
-    /* Enter Promiscuous mode to see all traffic on the interface. */
+    /* Promiscuous Mode */
     struct packet_mreq mreq;
     memset(&mreq, 0, sizeof(mreq));
     mreq.mr_ifindex = g_ifindex;
     mreq.mr_type = PACKET_MR_PROMISC;
     setsockopt(g_raw_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
-    /* Prepare for Memory Mapped RX. */
-    struct tpacket_req req;
-    memset(&req, 0, sizeof(req));
-    req.tp_block_size = BLOCK_SIZE;
-    req.tp_block_nr = BLOCK_NR;
-    req.tp_frame_size = FRAME_SIZE;
-    req.tp_frame_nr = FRAME_NR;
+    /* RX Ring Request */
+    struct tpacket_req req_rx;
+    memset(&req_rx, 0, sizeof(req_rx));
+    req_rx.tp_block_size = BLOCK_SIZE;
+    req_rx.tp_block_nr = BLOCK_NR;
+    req_rx.tp_frame_size = FRAME_SIZE;
+    req_rx.tp_frame_nr = FRAME_NR;
 
-    /* Tell the kernel to use the Ring Buffer for RX. */
-    if (setsockopt(g_raw_fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0) {
-        perror("setsockopt PACKET_RX_RING"); return -1;
+    if (setsockopt(g_raw_fd, SOL_PACKET, PACKET_RX_RING, &req_rx, sizeof(req_rx)) < 0) {
+        perror("setsockopt RX_RING"); return -1;
     }
 
-    /* Map the ring buffer into our process memory space */
-    size_t ring_size = (size_t)req.tp_block_nr * req.tp_block_size;
-    g_ring_buffer = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_raw_fd, 0);
-    if (g_ring_buffer == MAP_FAILED) { perror("mmap ring"); return -1; }
+    /* Map RX Buffer */
+    size_t rx_size = (size_t)req_rx.tp_block_nr * req_rx.tp_block_size;
+    g_ring_buffer = mmap(NULL, rx_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_raw_fd, 0);
+    if (g_ring_buffer == MAP_FAILED) { perror("mmap RX"); return -1; }
 
-    /* Set up local IO Vector array to track frame positions easily. */
-    g_ring_rd = malloc(req.tp_frame_nr * sizeof(struct iovec));
-    for (int i = 0; i < (int)req.tp_frame_nr; i++) {
-        g_ring_rd[i].iov_base = g_ring_buffer + (i * req.tp_frame_size);
-        g_ring_rd[i].iov_len = req.tp_frame_size;
+    /* Setup RX IO Vectors */
+    g_ring_rd = malloc(req_rx.tp_frame_nr * sizeof(struct iovec));
+    for (int i = 0; i < (int)req_rx.tp_frame_nr; i++) {
+        g_ring_rd[i].iov_base = g_ring_buffer + (i * req_rx.tp_frame_size);
+        g_ring_rd[i].iov_len = req_rx.tp_frame_size;
     }
 
-    /* Bind the RX socket to the interface. */
-    struct sockaddr_ll sll;
-    memset(&sll, 0, sizeof(sll));
-    sll.sll_family = AF_PACKET;
-    sll.sll_protocol = htons(ETH_P_ALL);
-    sll.sll_ifindex = g_ifindex;
-
-    if (bind(g_raw_fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
-        perror("bind raw"); return -1;
+    /* Bind RX Socket */
+    struct sockaddr_ll sll_rx;
+    memset(&sll_rx, 0, sizeof(sll_rx));
+    sll_rx.sll_family = AF_PACKET;
+    sll_rx.sll_protocol = htons(ETH_P_ALL);
+    sll_rx.sll_ifindex = g_ifindex;
+    if (bind(g_raw_fd, (struct sockaddr*)&sll_rx, sizeof(sll_rx)) < 0) {
+        perror("bind RX"); return -1;
     }
 
-    /* Record our MAC address */
+    /* 2. SETUP TX SOCKET (g_send_fd) - Uses PACKET_TX_RING */
+    g_send_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+    if (g_send_fd < 0) { perror("socket TX"); return -1; }
+
+    /* TX Ring Request */
+    struct tpacket_req req_tx;
+    memset(&req_tx, 0, sizeof(req_tx));
+    req_tx.tp_block_size = TX_BLOCK_SIZE;
+    req_tx.tp_block_nr = TX_BLOCK_NR;
+    req_tx.tp_frame_size = TX_FRAME_SIZE;
+    req_tx.tp_frame_nr = TX_FRAME_NR;
+
+    if (setsockopt(g_send_fd, SOL_PACKET, PACKET_TX_RING, &req_tx, sizeof(req_tx)) < 0) {
+        perror("setsockopt TX_RING"); return -1;
+    }
+
+    /* Map TX Buffer (Separate MMAP for separate FD) */
+    size_t tx_size = (size_t)req_tx.tp_block_nr * req_tx.tp_block_size;
+    g_tx_ring_buffer = mmap(NULL, tx_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_send_fd, 0);
+    if (g_tx_ring_buffer == MAP_FAILED) { perror("mmap TX"); return -1; }
+
+    /* Setup TX IO Vectors */
+    g_tx_ring_vec = malloc(req_tx.tp_frame_nr * sizeof(struct iovec));
+    for (int i = 0; i < (int)req_tx.tp_frame_nr; i++) {
+        g_tx_ring_vec[i].iov_base = g_tx_ring_buffer + (i * req_tx.tp_frame_size);
+        g_tx_ring_vec[i].iov_len = req_tx.tp_frame_size;
+    }
+
+    /* Bind TX Socket (CRITICAL: Kernel needs this to know where to flush the ring) */
+    struct sockaddr_ll sll_tx;
+    memset(&sll_tx, 0, sizeof(sll_tx));
+    sll_tx.sll_family = AF_PACKET;
+    sll_tx.sll_protocol = htons(ETH_P_IP);
+    sll_tx.sll_ifindex = g_ifindex;
+    if (bind(g_send_fd, (struct sockaddr*)&sll_tx, sizeof(sll_tx)) < 0) {
+        perror("bind TX"); return -1;
+    }
+
+    /* Retrieve MAC Address */
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, "veth-host", IFNAMSIZ - 1);
     if (ioctl(g_send_fd, SIOCGIFHWADDR, &ifr) < 0) {
-        perror("ioctl SIOCGIFHWADDR");
-        return -1;
+        perror("ioctl MAC"); return -1;
     }
     memcpy(g_src_mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
     
-    printf("(Network) Backend 'xdp-veth' initialized on 'veth'.\n");
+    printf("(Network) Backend 'xdp-veth' initialized (Dual Ring / Dual Socket Mode).\n");
     return 0;
 }
 
