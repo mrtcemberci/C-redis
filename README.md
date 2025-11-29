@@ -11,20 +11,27 @@ Project was built to improve my skills and efficiency in low-level system progra
 -Pluggable Network Backend: Includes production-ready implementations for:
   - epoll (Standard Linux high-performance I/O).
   - io_uring (Kernel's advanced asynchronous interface).
-  - XDP-Lite / AF_PACKET v3: A custom user-space TCP stack leveraging memory-mapped ring buffers for zero-copy reading and kernel bypass for maximum throughput.
+  - XDP-Lite / AF_PACKET v3: A custom user-space TCP stack leveraging memory-mapped RX ring buffer for zero-copy reading and kernel bypass for maximum throughput. Does not have a ring buffer for TX.
+  - VETH / XDP-LITE-PREMIUM: Follows the same as XDP-Lite but has a TX write ring and more optimisations. 
 - Fully Asynchronous I/O: Uses Edge-Triggered notification for both reads and writes.
 - Custom Key-Value Store: A from-scratch, resizing HashMap built with separate-chaining, proven Valgrind-clean for zero memory leaks. Also features a custom iterator API.
 - Robust State-Machine Parser: A hand-written parser for a text protocol with full quote-support (e.g., SET "my key" "my value").
 - Dynamic Client Buffers: Client read (realloc) and write (queue_client_response) buffers are fully dynamic, handling partial/streamed network data and large responses without blocking.
 
 # Benchmark
-- Performance testing on localhost loopback interface demonstrated the massive impact of low-level I/O and protocol optimisation.
-- You can run the benchmark by starting the server (following the guide below) and cd into the benchmark directory and running **make** to build the benchmark tool, you can configure the benchmark with the macros inside benchmark.c. Simply run with **/benchmark** with the server open.
+- I conducted comprehensive performance testing, focusing on the massive impact of low-level I/O and protocol optimization, particularly comparing the different backends on Loopback vs VETH setup.
+- To run the benchmarks start the server following the guide below, run **cd benchmark/** and **make** This outputs two executable files, latency and throughput. You can configure the macros inside both throughput.c and latency.c, you can run the tests with **sudo taskset -c {cores} ./{benchmark}** for the normal loopback/localhost backends.
+- To run the benchmark on the VETH backend you must run the script **veth-setup** inside **setup-scripts/**,
+this creates the VETH environment, which you can then run the benchmark via **sudo ip netns exec clientns taskset -c {cores} ./{benchmark} veth**
+- The latency test is designed to compensate for coordinated omission, which is a bias that occurs when slow-running serverices are less likely to be sampled by the benchmark client.
 - Here are some stats from when I ran the benchmarks.
-Backend	  Run 1	  Run 2	  Run 3	  Average Throughput
-EPOLL	    139,368	141,527	132,832	137,909 RPS
-IO_URING	159,539	142,707	160,671	154,306 RPS
-XDP-Lite	179,142	180,819	192,435	184,132 RPS
+| Metric | XDP-VETH | XDP-LITE (Localhost/loopback) | EPOLL (Localhost) | IO_URING (Localhost) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Max Throughput (RPS)** | **490,982** | 410,618 | 356,482 | 214,383 |
+| **P50 Latency @ 100k RPS** | **4,642 ns** | 5,681 ns | 7,552 ns | 11,686 ns |
+| **P99 Latency @ 100k RPS** | **6,189 ns** | 8,659 ns | 9,579 ns | 1,914,799 ns |
+| **P99.9 Latency @ 100k RPS** | **6,628 ns** | 35,808 ns | 11,678 ns | 2,526,099 ns |
+-- IO_URING has suspicious results.... Fix coming soon.
 
 # Server Hardening & Security
 - The server is hardened against common Denial of Service (DoS) attacks
@@ -48,9 +55,12 @@ XDP-Lite	179,142	180,819	192,435	184,132 RPS
 - **make clean**: Cleans all executables, object files, and test artifacts.
 
 # How to run
-- Once compiled by **make**, run ./redis-clone [epoll|io_uring|xdp] (defaults to epoll)
+- Once compiled by **make**, run ./redis-clone [epoll|io_uring|xdp|veth] (defaults to epoll)
 - The server starts to listen on port 6379
-- You can try connecting as a client via 'netcat localhost 6379'
+- to run the backend **VETH|XDP** you must run the **xdp-setup** and **xdp-reset** scripts inside **setup-scripts/** when starting and done.
+- to run the backend **VETH** you must also run the **veth-setup** script inside **setup-scripts/**
+- You can try connecting as a client via 'netcat localhost 6379' on non-veth backends.
+- YOu can try connecting as a client via 'sudo ip netns exec clientns nc 10.0.0.1 6379' on VETH backend.
 - You can disconnect user-side by CTRL+C
 - You can close the server by CTRL+C
-- Logs are printed to the console
+- Logs are printed to the console for join events etc.
