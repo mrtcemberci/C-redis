@@ -63,6 +63,12 @@
 #define XDP_TCP_ACK  0x10
 #define XDP_TCP_URG  0x20
 
+#define smp_wmb() __asm__ volatile("" ::: "memory")
+/* PAUSE instruction to reduce CPU power/contention in spin-loops */
+#define cpu_relax() __asm__ volatile("pause\n": : :"memory")
+
+static int g_max_session_fd = FAKE_FD_START;
+
 // Debug Macro
 #define DLOG(...) fprintf(stderr, "[XDP] " __VA_ARGS__)
 
@@ -117,8 +123,8 @@ typedef struct {
 
 static unsigned char g_src_mac[ETH_ALEN];
 static TcpSession g_sessions[MAX_CLIENTS]; /* Global table of all active connections. */
-static int        g_raw_fd = -1;  /* The AF_PACKET socket for Receiving. */
-static int        g_send_fd = -1; /* The AF_INET Raw socket for Sending. */
+static int        g_rx_fd = -1;  /* The AF_PACKET socket for Receiving. */
+static int        g_tx_fd = -1; /* The AF_INET Raw socket for Sending. */
 static char* g_ring_buffer = NULL;/* Pointer to the mmap'd shared memory region. */
 static struct     iovec *g_ring_rd = NULL; /* Helper array to track where frames are in the ring. */
 static int        g_ring_offset = 0; /* Current position in the ring buffer. */
@@ -134,8 +140,17 @@ static char *g_tx_ring_buffer = NULL;
 static struct iovec *g_tx_ring_vec = NULL;
 static int g_tx_ring_offset = 0;
 
-// Forward declarations
 static void handle_rx_packet(void *data, size_t len);
+
+static inline uint32_t create_isn() {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    
+    uint32_t isn = (uint32_t)ts.tv_sec ^ (uint32_t)ts.tv_nsec ^ (uint32_t)getpid();
+    
+    return isn;
+}
 
 /*
  * Standard Internet Checksum algorithm (RFC 1071).
@@ -244,6 +259,9 @@ static inline void drain_rx_queue_internal(void) {
 
         // Return this slot to the kernel, move forward
         tp->tp_status = TP_STATUS_KERNEL;
+        /* Memory barrier to prevent CPU from going ahead without all memory operations before
+        being complete  */
+        __sync_synchronize();
         idx++;
         if (idx >= FRAME_NR)
             idx = 0;
@@ -255,19 +273,28 @@ static inline void drain_rx_queue_internal(void) {
 
 /*
  * Another CORE I/O function
- * Constructs and transmits a raw TCP/IP packet
- * We manually build: IP Header -> TCP Header -> Options -> Payload.
+ * Constructs and transmits a raw packet
+ * We manually build: Ethernet header -> IP Header -> TCP Header -> Options -> Payload.
+ * Uses a TX ring and immediate flush for low-latency.
  */
 static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uint8_t flags) {
     int idx = g_tx_ring_offset;
     volatile struct tpacket_hdr *tp = (struct tpacket_hdr *)g_tx_ring_vec[idx].iov_base;
 
+    int next_idx = (idx + 1) % TX_FRAME_NR;
+    /* Pre-fetch the next slot into the cache */
+    __builtin_prefetch(g_tx_ring_vec[next_idx].iov_base, 1, 1);
+
     /* Spin-Wait for Ring Slot */
     int retries = 0;
     while (tp->tp_status != TP_STATUS_AVAILABLE && tp->tp_status != TP_STATUS_WRONG_FORMAT) {
-        sendto(g_send_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
-        /* You can add a poll here but I dont want to context-switch. I would rather 
-        burn CPU-cycles for low latency. */
+        /* Optimization: Only kick kernel once every 32 spins to reduce lock contention */
+        if ((retries & 31) == 0) {
+            sendto(g_tx_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+        }
+        
+        cpu_relax(); /* Pause instruction */
+        
         if (++retries > 10000000) { 
             fprintf(stderr, "[FATAL] TX Ring Stuck! Interface down?\n");
             return; 
@@ -350,15 +377,16 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
 
     tp->tp_len = total_len;
     tp->tp_snaplen = total_len;
+    smp_wmb();
     tp->tp_status = TP_STATUS_SEND_REQUEST;
     
-    ssize_t sent = sendto(g_send_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    ssize_t sent = sendto(g_tx_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
     if (sent < 0 && errno == ENOBUFS) {
         /* Congestion handling: do nothing, loop or poll will handle it, it is in the ring now anyway */
     }
 
     /* Advance Ring */
-    g_tx_ring_offset = (g_tx_ring_offset + 1) % TX_FRAME_NR;
+    g_tx_ring_offset = next_idx;
 
     /* Update Sequence */
     if (len > 0) s->seq_num += len;
@@ -367,7 +395,7 @@ static inline void send_raw_packet(char *payload, size_t len, TcpSession *s, uin
 
 /* Helper to find an existing session by Source IP/Port */
 static TcpSession* get_session(uint32_t saddr, uint16_t sport) {
-    for (int i=0; i<MAX_CLIENTS; i++) {
+    for (int i=FAKE_FD_START; i<MAX_CLIENTS; i++) {
         if (g_sessions[i].active && 
             g_sessions[i].dst_ip == saddr && 
             g_sessions[i].dst_port == sport) {
@@ -387,20 +415,22 @@ static TcpSession* create_session(uint32_t saddr, uint16_t sport, uint32_t daddr
             g_sessions[i].accepted = 0; 
             g_sessions[i].id = i; 
             g_sessions[i].state = TCP_LISTEN;
-            g_sessions[i].dst_ip = saddr;   /* Swapped: Packet Src is Session Dst */
-            g_sessions[i].src_ip = daddr;   /* Swapped: Packet Dst is Session Src */
+            g_sessions[i].dst_ip = saddr;
+            g_sessions[i].src_ip = daddr;
             g_sessions[i].dst_port = sport; 
             g_sessions[i].src_port = dport; 
             // This is hard-coded in VETH pair but not hardcoding is fine
             // unsigned char static_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x02};
             // memcpy(g_sessions[i].client_mac, static_mac, ETH_ALEN);
             memcpy(g_sessions[i].client_mac, mac, ETH_ALEN);
-            g_sessions[i].seq_num = 1000;   /* Initial Sequence Number (ISN) */
+            g_sessions[i].seq_num = create_isn();   /* Initial Sequence Number (ISN) */
             g_sessions[i].rx_head = 0;
             g_sessions[i].rx_tail = 0;
             g_sessions[i].ts_present = 0;
             g_sessions[i].ts_recent = 0;
             g_sessions[i].client_wscale = 0;
+
+            if (i > g_max_session_fd) g_max_session_fd = i;
             
             DLOG("New Session FD:%d Port:%d\n", i, ntohs(sport));
             return &g_sessions[i];
@@ -428,7 +458,6 @@ static void handle_rx_packet(void *data, size_t len) {
     if (ntohs(tcph->source) == LISTEN_PORT) return;
     if (ntohs(tcph->dest) != LISTEN_PORT) return;
 
-    /* --- OPTION PARSING START --- */
     uint32_t ts_val = 0;
     int ts_found = 0;
     int wscale_found = 0;
@@ -453,14 +482,13 @@ static void handle_rx_packet(void *data, size_t len) {
             wscale_found = 1;
         } 
         else if (kind == 8 && len == 10) { // Timestamp
-            // TS Value is the first 4 bytes of the value (bytes 2,3,4,5)
+            // TS Value is the first 4 bytes of the value
             uint32_t *ts_ptr = (uint32_t*)(opt_ptr + i + 2);
             ts_val = ntohl(*ts_ptr);
             ts_found = 1;
         }
         i += len;
     }
-    /* --- OPTION PARSING END --- */
 
     TcpSession *sess = get_session(iph->saddr, tcph->source);
 
@@ -478,7 +506,6 @@ static void handle_rx_packet(void *data, size_t len) {
                 sess->client_wscale = wscale_found ? wscale_val : 0;
                 
                 sess->ack_num = seq + 1; 
-                sess->seq_num = 1000;    
                 sess->state = TCP_SYN_RCVD;
                 send_raw_packet(NULL, 0, sess, XDP_TCP_SYN | XDP_TCP_ACK);
             }
@@ -487,7 +514,7 @@ static void handle_rx_packet(void *data, size_t len) {
             if (ts_found) sess->ts_recent = ts_val; 
             
             sess->ack_num = seq + 1;
-            sess->seq_num = 1000; 
+            sess->seq_num = create_isn(); 
             sess->state = TCP_SYN_RCVD;
             sess->rx_head = sess->rx_tail = 0; 
             send_raw_packet(NULL, 0, sess, XDP_TCP_SYN | XDP_TCP_ACK);
@@ -505,7 +532,7 @@ static void handle_rx_packet(void *data, size_t len) {
     
     if (tcph->ack) {
         if (sess->state == TCP_SYN_RCVD && !tcph->syn) {
-            if (ack_seq == 1001) {
+            if (ack_seq == sess->seq_num) {
                 sess->state = TCP_ESTABLISHED;
             }
         }
@@ -532,7 +559,7 @@ static void handle_rx_packet(void *data, size_t len) {
                 sess->ack_num = seq + seg_len; 
                 
                 // IMMEDIATE ACK
-                send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
+                //send_raw_packet(NULL, 0, sess, XDP_TCP_ACK);
             } 
         }
     }
@@ -549,9 +576,9 @@ static void handle_rx_packet(void *data, size_t len) {
 }
 
 static int backend_init(void) {
-    /* 1. SETUP RX SOCKET (g_raw_fd) - Uses PACKET_RX_RING */
-    g_raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (g_raw_fd < 0) { perror("socket RX"); return -1; }
+    /* SETUP RX SOCKET (g_rx_fd)*/
+    g_rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (g_rx_fd < 0) { perror("socket RX"); return -1; }
 
     /* Get Interface Index */
     g_ifindex = if_nametoindex("veth-host");
@@ -562,7 +589,7 @@ static int backend_init(void) {
     memset(&mreq, 0, sizeof(mreq));
     mreq.mr_ifindex = g_ifindex;
     mreq.mr_type = PACKET_MR_PROMISC;
-    setsockopt(g_raw_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    setsockopt(g_rx_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
     /* RX Ring Request */
     struct tpacket_req req_rx;
@@ -572,13 +599,13 @@ static int backend_init(void) {
     req_rx.tp_frame_size = FRAME_SIZE;
     req_rx.tp_frame_nr = FRAME_NR;
 
-    if (setsockopt(g_raw_fd, SOL_PACKET, PACKET_RX_RING, &req_rx, sizeof(req_rx)) < 0) {
+    if (setsockopt(g_rx_fd, SOL_PACKET, PACKET_RX_RING, &req_rx, sizeof(req_rx)) < 0) {
         perror("setsockopt RX_RING"); return -1;
     }
 
     /* Map RX Buffer */
     size_t rx_size = (size_t)req_rx.tp_block_nr * req_rx.tp_block_size;
-    g_ring_buffer = mmap(NULL, rx_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_raw_fd, 0);
+    g_ring_buffer = mmap(NULL, rx_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_rx_fd, 0);
     if (g_ring_buffer == MAP_FAILED) { perror("mmap RX"); return -1; }
 
     /* Setup RX IO Vectors */
@@ -594,13 +621,13 @@ static int backend_init(void) {
     sll_rx.sll_family = AF_PACKET;
     sll_rx.sll_protocol = htons(ETH_P_ALL);
     sll_rx.sll_ifindex = g_ifindex;
-    if (bind(g_raw_fd, (struct sockaddr*)&sll_rx, sizeof(sll_rx)) < 0) {
+    if (bind(g_rx_fd, (struct sockaddr*)&sll_rx, sizeof(sll_rx)) < 0) {
         perror("bind RX"); return -1;
     }
 
-    /* 2. SETUP TX SOCKET (g_send_fd) - Uses PACKET_TX_RING */
-    g_send_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-    if (g_send_fd < 0) { perror("socket TX"); return -1; }
+    /*  SETUP TX SOCKET (g_tx_fd) */
+    g_tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+    if (g_tx_fd < 0) { perror("socket TX"); return -1; }
 
     /* TX Ring Request */
     struct tpacket_req req_tx;
@@ -610,13 +637,13 @@ static int backend_init(void) {
     req_tx.tp_frame_size = TX_FRAME_SIZE;
     req_tx.tp_frame_nr = TX_FRAME_NR;
 
-    if (setsockopt(g_send_fd, SOL_PACKET, PACKET_TX_RING, &req_tx, sizeof(req_tx)) < 0) {
+    if (setsockopt(g_tx_fd, SOL_PACKET, PACKET_TX_RING, &req_tx, sizeof(req_tx)) < 0) {
         perror("setsockopt TX_RING"); return -1;
     }
 
     /* Map TX Buffer (Separate MMAP for separate FD) */
     size_t tx_size = (size_t)req_tx.tp_block_nr * req_tx.tp_block_size;
-    g_tx_ring_buffer = mmap(NULL, tx_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_send_fd, 0);
+    g_tx_ring_buffer = mmap(NULL, tx_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_tx_fd, 0);
     if (g_tx_ring_buffer == MAP_FAILED) { perror("mmap TX"); return -1; }
 
     /* Setup TX IO Vectors */
@@ -626,13 +653,13 @@ static int backend_init(void) {
         g_tx_ring_vec[i].iov_len = req_tx.tp_frame_size;
     }
 
-    /* Bind TX Socket (CRITICAL: Kernel needs this to know where to flush the ring) */
+    /* Bind TX Socket */
     struct sockaddr_ll sll_tx;
     memset(&sll_tx, 0, sizeof(sll_tx));
     sll_tx.sll_family = AF_PACKET;
     sll_tx.sll_protocol = htons(ETH_P_IP);
     sll_tx.sll_ifindex = g_ifindex;
-    if (bind(g_send_fd, (struct sockaddr*)&sll_tx, sizeof(sll_tx)) < 0) {
+    if (bind(g_tx_fd, (struct sockaddr*)&sll_tx, sizeof(sll_tx)) < 0) {
         perror("bind TX"); return -1;
     }
 
@@ -640,7 +667,7 @@ static int backend_init(void) {
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, "veth-host", IFNAMSIZ - 1);
-    if (ioctl(g_send_fd, SIOCGIFHWADDR, &ifr) < 0) {
+    if (ioctl(g_tx_fd, SIOCGIFHWADDR, &ifr) < 0) {
         perror("ioctl MAC"); return -1;
     }
     memcpy(g_src_mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
@@ -663,7 +690,7 @@ static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
     
     // This reports new connections
     /* Scan session list for any connection that finished the Handshake but hasn't been Accept()'d. */
-    for (int i=FAKE_FD_START; i<MAX_CLIENTS; i++) {
+    for (int i=FAKE_FD_START; i<=g_max_session_fd; i++) {
         if (g_sessions[i].active && g_sessions[i].state == TCP_ESTABLISHED && !g_sessions[i].accepted) {
             IOEvent* ev = &events[n++];
             ev->fd = FAKE_LISTENER_FD; /* Tell server: "Event on Listener" */
@@ -676,7 +703,7 @@ static int backend_poll(IOEvent* events, int max_events, int timeout_ms) {
     
     //  Report Data Available OR EOF
     /* Scan active sessions for data in their RX buffers or Close states. */
-    for (int i = FAKE_FD_START; i < MAX_CLIENTS; i++) {
+    for (int i = FAKE_FD_START; i <= g_max_session_fd; i++) {
         if (!g_sessions[i].active) continue;
         
         if (g_sessions[i].state == TCP_CLOSE_WAIT) {
@@ -704,7 +731,7 @@ static int backend_socket_create_listener(int port) { (void)port; return FAKE_LI
 static int backend_socket_accept(int listener_fd, char* ip_buf, size_t ip_buf_len) {
     (void)listener_fd;
     /* Find a session marked as "accepted=1" (by poll) and transition it to "accepted=2". */
-    for (int i=FAKE_FD_START; i<MAX_CLIENTS; i++) {
+    for (int i=FAKE_FD_START; i<= g_max_session_fd; i++) {
         if (g_sessions[i].active && g_sessions[i].state == TCP_ESTABLISHED && g_sessions[i].accepted == 1) {
             g_sessions[i].accepted = 2; // Consumed
             if (ip_buf) snprintf(ip_buf, ip_buf_len, "127.0.0.1");
@@ -731,6 +758,19 @@ static void backend_socket_close(int fd) {
         g_sessions[fd].accepted = 0;
         g_sessions[fd].rx_head = 0;
         g_sessions[fd].rx_tail = 0;
+
+        /* Lazy reset for max_session_fd */
+        if (fd == g_max_session_fd) {
+            int new_max = FAKE_FD_START; 
+            
+            for (int i = fd - 1; i >= FAKE_FD_START; i--) {
+                if (g_sessions[i].active) {
+                    new_max = i;
+                    break;
+                }
+            }
+            g_max_session_fd = new_max;
+        }
     }
 }
 /* These are no-ops because our custom stack handles state internally or doesn't support these specific ops. */
